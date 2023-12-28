@@ -1,191 +1,287 @@
-# -*- coding: utf-8 -*-
-import random
-import time
+import re
+from typing import TYPE_CHECKING
 
-from ethereum import slogging
-
+import click
 import gevent
+import requests
+import structlog
+from eth_utils import to_hex
 from gevent.event import AsyncResult
-from gevent.queue import Queue
-from gevent.timeout import Timeout
+from pkg_resources import parse_version
+from web3 import Web3
+from web3.types import BlockData
 
-from raiden.settings import (
-    DEFAULT_HEALTHCHECK_POLL_TIMEOUT,
+from raiden.api.objects import Notification
+from raiden.constants import (
+    BLOCK_ID_LATEST,
+    CHECK_CHAIN_ID_INTERVAL,
+    CHECK_GAS_RESERVE_INTERVAL,
+    CHECK_RDN_MIN_DEPOSIT_INTERVAL,
+    CHECK_VERSION_INTERVAL,
+    LATEST,
+    RELEASE_PAGE,
+    SECURITY_EXPRESSION,
+    NotificationIDs,
 )
+from raiden.network.proxies.proxy_manager import ProxyManager
+from raiden.network.proxies.user_deposit import UserDeposit
+from raiden.settings import MIN_REI_THRESHOLD
+from raiden.utils import gas_reserve
+from raiden.utils.formatting import to_checksum_address
+from raiden.utils.runnable import Runnable
+from raiden.utils.transfers import to_rdn
+from raiden.utils.typing import Any, BlockNumber, Callable, ChainID, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from raiden.raiden_service import RaidenService
 
 REMOVE_CALLBACK = object()
-log = slogging.get_logger(__name__)  # pylint: disable=invalid-name
+log = structlog.get_logger(__name__)
 
 
-class Task(gevent.Greenlet):
-    """ Base class used to created tasks.
+def _do_check_version(current_version: Tuple[str, ...], raiden: "RaidenService") -> bool:
+    content = requests.get(LATEST).json()
+    if "tag_name" not in content:
+        # probably API rate limit exceeded
+        click.secho(
+            "Error while contacting github for latest version. API rate limit exceeded?", fg="red"
+        )
+        return False
+    # getting the latest release version
+    latest_release = parse_version(content["tag_name"])
+    security_message = re.search(SECURITY_EXPRESSION, content["body"])
+    if security_message:
+        notification = Notification(
+            id=NotificationIDs.VERSION_SECURITY_WARNING.value,
+            summary="Security Warning",
+            body=security_message.group(0),
+            urgency="high",
+        )
+        raiden.add_notification(notification, click_opts={"fg": "red"})
 
-    Note:
-        Always call super().__init__().
-    """
-
-    def __init__(self):
-        super(Task, self).__init__()
-        self.response_queue = Queue()
-
-
-class HealthcheckTask(Task):
-    """ Task for checking if all of our open channels are healthy """
-
-    def __init__(
-            self,
-            raiden,
-            send_ping_time,
-            max_unresponsive_time,
-            sleep_time=DEFAULT_HEALTHCHECK_POLL_TIMEOUT):
-
-        """
-        Initialize a HealthcheckTask that will monitor open channels for
-        responsiveness.
-
-        Args:
-            raiden (RaidenService): The Raiden service which will give us
-                access to the protocol object and to the token manager.
-            sleep_time (int): Time in seconds between each healthcheck task.
-            send_ping_time (int): Time in seconds after not having received a
-                message from an address at which to send a Ping.
-            max_unresponsive_time (int): Time in seconds after not having
-                received a message from an address at which it should be
-                deleted.
-         """
-        super(HealthcheckTask, self).__init__()
-
-        self.protocol = raiden.protocol
-        self.raiden = raiden
-
-        self.stop_event = AsyncResult()
-        self.sleep_time = sleep_time
-        self.send_ping_time = send_ping_time
-        self.max_unresponsive_time = max_unresponsive_time
-        self.timeout = None
-
-    def _run(self):  # pylint: disable=method-hidden
-        stop = None
-        sleep_upper_bound = int(0.2 * self.send_ping_time)
-
-        while stop is None:
-            keys_to_remove = []
-            for key, queue in self.protocol.address_queue.iteritems():
-                receiver_address = key[0]
-                token_address = key[1]
-                if queue.empty():
-                    last_time = self.protocol.last_received_time[receiver_address]
-                    elapsed_time = time.time() - last_time
-
-                    # Add a randomized delay in the loop to not clog the network
-                    gevent.sleep(random.randint(0, sleep_upper_bound))
-
-                    if elapsed_time > self.max_unresponsive_time:
-                        graph = self.raiden.channelgraphs[token_address]
-                        graph.remove_path(self.protocol.raiden.address, receiver_address)
-                        # remove the node from the queue
-                        keys_to_remove.append(key)
-                    elif elapsed_time > self.send_ping_time:
-                        self.protocol.send_ping(receiver_address)
-
-            for key in keys_to_remove:
-                self.protocol.address_queue.pop(key)
-
-            self.timeout = Timeout(self.sleep_time)  # wait() will call cancel()
-            stop = self.stop_event.wait(self.timeout)
-
-    def stop_and_wait(self):
-        self.stop_event.set(True)
-        gevent.wait(self)
-
-    def stop_async(self):
-        self.stop_event.set(True)
+        # comparing it to the user's application
+    if current_version < latest_release:
+        msg = (
+            f"You're running version {current_version}. The latest version is {latest_release}"
+            f"It's time to update! Releases: {RELEASE_PAGE}"
+        )
+        notification = Notification(
+            id=NotificationIDs.VERSION_OUTDATED.value,
+            summary="Your version is outdated",
+            body=msg,
+            urgency="normal",
+        )
+        raiden.add_notification(notification, click_opts={"fg": "red"})
+        return False
+    return True
 
 
-class AlarmTask(Task):
-    """ Task to notify when a block is mined. """
+def check_version(current_version: str, raiden: "RaidenService") -> None:  # pragma: no unittest
+    """Check periodically for a new release"""
+    app_version = parse_version(current_version)
+    while True:
+        try:
+            _do_check_version(app_version, raiden)
+        except (requests.exceptions.HTTPError, ValueError) as err:
+            click.secho("Error while checking for version", fg="red")
+            print(err)
 
-    def __init__(self, chain):
-        super(AlarmTask, self).__init__()
+        # repeat the process once every 3h
+        gevent.sleep(CHECK_VERSION_INTERVAL)
 
-        self.callbacks = list()
-        self.stop_event = AsyncResult()
-        self.chain = chain
-        self.last_block_number = self.chain.block_number()
 
-        # TODO: Start with a larger wait_time and decrease it as the
+def check_gas_reserve(raiden: "RaidenService") -> None:  # pragma: no unittest
+    """Check periodically for gas reserve in the account"""
+    while True:
+        has_enough_balance, estimated_required_balance = gas_reserve.has_enough_gas_reserve(
+            raiden, channels_to_open=1
+        )
+        estimated_required_balance_eth = Web3.fromWei(estimated_required_balance, "ether")
+
+        if not has_enough_balance:
+            notification_body = (
+                "WARNING\n"
+                "Your account's balance is below the estimated gas reserve of "
+                f"{estimated_required_balance_eth} eth. This may lead to a loss of "
+                "of funds because your account will be unable to perform on-chain "
+                "transactions. Please add funds to your account as soon as possible."
+            )
+            notification = Notification(
+                id=NotificationIDs.MISSING_GAS_RESERVE.value,
+                summary="Missing gas reserve",
+                body=notification_body,
+                urgency="normal",
+            )
+            raiden.add_notification(
+                notification,
+                log_opts={"required_wei": estimated_required_balance},
+                click_opts={"fg": "red"},
+            )
+
+        gevent.sleep(CHECK_GAS_RESERVE_INTERVAL)
+
+
+def check_rdn_deposits(
+    raiden: "RaidenService", user_deposit_proxy: UserDeposit
+) -> None:  # pragma: no unittest
+    """Check periodically for RDN deposits in the user-deposits contract"""
+    while True:
+        rei_balance = user_deposit_proxy.effective_balance(raiden.address, BLOCK_ID_LATEST)
+        rdn_balance = to_rdn(rei_balance)
+        if rei_balance < MIN_REI_THRESHOLD:
+            notification_body = (
+                f"WARNING\n"
+                f"Your account's RDN balance deposited in the UserDepositContract of "
+                f"{rdn_balance} is below the minimum threshold {to_rdn(MIN_REI_THRESHOLD)}. "
+                f"Provided that you have either a monitoring service or a path "
+                f"finding service activated, your node is not going to be able to "
+                f"pay those services which may lead to denial of service or loss of funds."
+            )
+            notification = Notification(
+                id=NotificationIDs.LOW_RDN.value,
+                summary="RDN balance too low",
+                body=notification_body,
+                urgency="normal",
+            )
+            raiden.add_notification(notification, click_opts={"fg": "red"})
+
+        gevent.sleep(CHECK_RDN_MIN_DEPOSIT_INTERVAL)
+
+
+def check_chain_id(chain_id: ChainID, web3: Web3) -> None:  # pragma: no unittest
+    """Check periodically if the underlying ethereum client's network id has changed"""
+    while True:
+        try:
+            current_id = web3.eth.chain_id
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                "Could not reach ethereum RPC. "
+                "Please check that your ethereum node is running and accessible."
+            )
+        if chain_id != current_id:
+            raise RuntimeError(
+                f"Raiden was running on network with id {chain_id} and it detected "
+                f"that the underlying ethereum client network id changed to {current_id}."
+                f" Changing the underlying blockchain while the Raiden node is running "
+                f"is not supported."
+            )
+        gevent.sleep(CHECK_CHAIN_ID_INTERVAL)
+
+
+class AlarmTask(Runnable):
+    """Task to notify when a block is mined."""
+
+    def __init__(self, proxy_manager: ProxyManager, sleep_time: float) -> None:
+        super().__init__()
+
+        self.callbacks: List[Callable] = list()
+        self.proxy_manager = proxy_manager
+        self.rpc_client = proxy_manager.client
+
+        self.known_block_number: Optional[BlockNumber] = None
+        self._stop_event: Optional[AsyncResult] = None
+
+        # TODO: Start with a larger sleep_time and decrease it as the
         # probability of a new block increases.
-        self.wait_time = 0.5
-        self.last_loop = time.time()
+        self.sleep_time = sleep_time
 
-    def register_callback(self, callback):
-        """ Register a new callback.
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__} node:" f"{to_checksum_address(self.rpc_client.address)}>"
+        )
+
+    def start(self) -> None:
+        log.debug("Alarm task started", node=to_checksum_address(self.rpc_client.address))
+        self._stop_event = AsyncResult()
+        super().start()
+
+    def _run(self, *args: Any, **kwargs: Any) -> None:  # pylint: disable=method-hidden
+        self.greenlet.name = f"AlarmTask._run node:{to_checksum_address(self.rpc_client.address)}"
+        try:
+            self.loop_until_stop()
+        finally:
+            self.callbacks = list()
+
+    def register_callback(self, callback: Callable) -> None:
+        """Register a new callback.
 
         Note:
-            This callback will be executed in the AlarmTask context and for
+            The callback will be executed in the AlarmTask context and for
             this reason it should not block, otherwise we can miss block
             changes.
         """
         if not callable(callback):
-            raise ValueError('callback is not a callable')
+            raise ValueError("callback is not a callable")
 
         self.callbacks.append(callback)
 
-    def _run(self):  # pylint: disable=method-hidden
-        log.debug('starting block number', block_number=self.last_block_number)
+    def remove_callback(self, callback: Callable) -> None:
+        """Remove callback from the list of callbacks if it exists"""
+        if callback in self.callbacks:
+            self.callbacks.remove(callback)
 
-        sleep_time = 0
-        while self.stop_event.wait(sleep_time) is not True:
-            self.poll_for_new_block()
+    def loop_until_stop(self) -> None:
+        sleep_time = self.sleep_time
+        while self._stop_event and self._stop_event.wait(sleep_time) is not True:
+            latest_block = self.rpc_client.get_block(block_identifier=BLOCK_ID_LATEST)
 
-            # we want this task to iterate in the tick of `wait_time`, so take
-            # into account how long we spent executing one tick.
-            self.last_loop = time.time()
-            work_time = self.last_loop - self.last_loop
-            if work_time > self.wait_time:
-                log.warning(
-                    'alarm loop is taking longer than the wait time',
-                    work_time=work_time,
-                    wait_time=self.wait_time,
-                )
-                sleep_time = 0.001
-            else:
-                sleep_time = self.wait_time - work_time
+            self._maybe_run_callbacks(latest_block)
 
-    def poll_for_new_block(self):
-        current_block = self.chain.block_number()
+    def _maybe_run_callbacks(self, latest_block: BlockData) -> None:
+        """Run the callbacks if there is at least one new block.
 
-        if current_block > self.last_block_number + 1:
-            difference = current_block - self.last_block_number - 1
-            log.error(
-                'alarm missed %s blocks',
-                difference,
+        The callbacks are executed only if there is a new block, otherwise the
+        filters may try to poll for an inexisting block number and the Ethereum
+        client can return an JSON-RPC error.
+        """
+        latest_block_number = latest_block["number"]
+
+        # First run, set the block and run the callbacks
+        if self.known_block_number is None:
+            self.known_block_number = latest_block_number
+            missed_blocks = 1
+        else:
+            missed_blocks = latest_block_number - self.known_block_number
+
+        if missed_blocks < 0:
+            log.critical(
+                "Block number decreased",
+                chain_id=self.rpc_client.chain_id,
+                known_block_number=self.known_block_number,
+                old_block_number=latest_block["number"],
+                old_gas_limit=latest_block["gasLimit"],
+                old_block_hash=to_hex(latest_block["hash"]),
+                node=to_checksum_address(self.rpc_client.address),
             )
-
-        if current_block != self.last_block_number:
-            log.debug(
-                'new block',
-                number=current_block,
-                timestamp=self.last_loop,
+        elif missed_blocks > 0:
+            log_details = dict(
+                known_block_number=self.known_block_number,
+                latest_block_number=latest_block_number,
+                latest_block_hash=to_hex(latest_block["hash"]),
+                latest_block_gas_limit=latest_block["gasLimit"],
+                node=to_checksum_address(self.rpc_client.address),
             )
+            if missed_blocks > 1:
+                log_details["num_missed_blocks"] = missed_blocks - 1
 
-            self.last_block_number = current_block
+            log.debug("Received new block", **log_details)
+
             remove = list()
             for callback in self.callbacks:
-                try:
-                    result = callback(current_block)
-                except:  # pylint: disable=bare-except
-                    log.exception('unexpected exception on alarm')
-                else:
-                    if result is REMOVE_CALLBACK:
-                        remove.append(callback)
+                result = callback(latest_block)
+                if result is REMOVE_CALLBACK:
+                    remove.append(callback)
 
             for callback in remove:
                 self.callbacks.remove(callback)
 
-    def stop_and_wait(self):
-        self.stop_event.set(True)
-        gevent.wait(self)
+            self.known_block_number = latest_block_number
 
-    def stop_async(self):
-        self.stop_event.set(True)
+    def stop(self) -> Any:
+        if self._stop_event:
+            self._stop_event.set(True)
+        log.debug("Alarm task stopped", node=to_checksum_address(self.rpc_client.address))
+        result = self.greenlet.join()
+        # Callbacks should be cleaned after join
+        self.callbacks = []
+        return result

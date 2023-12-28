@@ -5,16 +5,22 @@ help:
 	@echo "clean-build - remove build artifacts"
 	@echo "clean-pyc - remove Python file artifacts"
 	@echo "clean-test - remove test and coverage artifacts"
-	@echo "lint - check style with flake8"
+	@echo "-"
+	@echo "lint - run all checks (style, mypy, etc.)"
+	@echo "mypy - check types with mypy (coverage in progress)"
+	@echo "mypy-all - Run mypy without filters and report remaining issue count"
+	@echo "format - run isort and black"
+	@echo "isort - use isort to fix import order"
+	@echo "black - reformat code with black"
 	@echo "test - run tests quickly with the default Python"
-	@echo "test-all - run tests on every Python version with tox"
 	@echo "coverage - check code coverage quickly with the default Python"
-	#@echo "docs - generate Sphinx HTML documentation, including API docs"
-	#@echo "release - package and upload a release"
-	#@echo "dist - package"
-	#@echo "install - install the package to the active Python's site-packages"
-	@echo "deploy - deploy contracts via rpc"
-
+	@echo "-"
+	@echo "install - install Raiden and runtime requirements into the active virtualenv"
+	@echo "install-dev - install Raiden in editable mode and development dependencies into the active virtualenv"
+	@echo "-"
+	@echo "bundle - create standalone executable with PyInstaller"
+	@echo "bundle-docker - create standalone executable with PyInstaller via a docker container"
+	@echo "docs - generate Sphinx HTML documentation, including API docs"
 
 
 clean: clean-build clean-pyc clean-test
@@ -29,7 +35,6 @@ clean-build:
 clean-pyc:
 	find . -name '*.pyc' -exec rm -f {} +
 	find . -name '*.pyo' -exec rm -f {} +
-	find . -name '*~' -exec rm -f {} +
 	find . -name '__pycache__' -exec rm -fr {} +
 
 clean-test:
@@ -37,125 +42,108 @@ clean-test:
 	rm -f .coverage
 	rm -fr htmlcov/
 
-lint:
-	flake8 raiden tests
+# CircleCI always reports 36 CPUs, force tools to use the actual number
+JOBS_ARG=
+ifdef CIRCLECI
+JOBS_ARG=--jobs=8
+endif
+LINT_PATHS = raiden/ tools/ setup.py conftest.py
+ISORT_PARAMS = --ignore-whitespace --settings-path ./ --skip-glob '*/node_modules/*' $(LINT_PATHS)
+
+lint: ISORT_CHECK_PARAMS := --diff --check-only
+lint: BLACK_CHECK_PARAMS := --check --diff
+lint: format flake8 mypy pylint shellcheck check-pre-commit
+
+mypy:
+	mypy raiden tools
+
+mypy-all:
+	# Be aware, that we currently ignore all mypy errors in `raiden.tests.*` through `setup.cfg`.
+	# Remaining errors in tests:
+	mypy --config-file /dev/null raiden --ignore-missing-imports | grep error | wc -l
+
+flake8:
+	flake8 $(JOBS_ARG) $(LINT_PATHS)
+
+pylint:
+	pylint $(JOBS_ARG) $(LINT_PATHS)
+
+isort:
+	isort $(JOBS_ARG) $(ISORT_PARAMS) $(ISORT_CHECK_PARAMS)
+
+black:
+	black $(BLACK_CHECK_PARAMS) $(LINT_PATHS)
+
+shellcheck:
+ifeq (, $(shell command -v shellcheck 2> /dev/null))
+	@echo "Shellcheck isn't installed. Shell scripts won't be linted!"
+else
+	find tools/ .circleci/ -name "*.sh" -print0 | xargs -0 shellcheck -x
+	shellcheck requirements/deps
+endif
+
+check-pre-commit:
+	python tools/pre-commit/pre-commit-check-versions.py
+
+format: isort black
 
 test:
-	python setup.py test
-
-test-all:
-	tox
+	pytest -n auto -v raiden/tests
 
 coverage:
-	coverage run --source raiden setup.py test
+	coverage run --source raiden pytest -v raiden/tests
 	coverage report -m
 	coverage html
-	open htmlcov/index.html
 
 docs:
 	rm -f docs/raiden.rst
 	rm -f docs/modules.rst
-	sphinx-apidoc -o docs/ raiden
+#     sphinx-apidoc -o docs/ raiden
 	$(MAKE) -C docs clean
 	$(MAKE) -C docs html
-	open docs/_build/html/index.html
+
+
+install: check-pip-tools clean-pyc
+	cd requirements; pip-sync requirements.txt _raiden.txt
+
+install-dev: check-pip-tools clean-pyc osx-detect-proper-python
+# Remove extras from requirements to produce a valid constraints file.
+# See: https://github.com/pypa/pip/issues/9209
+	@sed -e 's/\[[^]]*\]//g' requirements/requirements-dev.txt > requirements/constraints-dev.txt
+	@touch requirements/requirements-local.txt
+	cd requirements; pip-sync requirements-dev.txt _raiden-dev.txt
+	pip install -c requirements/constraints-dev.txt -r requirements/requirements-local.txt
+	@rm requirements/constraints-dev.txt
+
+osx-detect-proper-python:
+ifeq ($(shell uname -s),Darwin)
+	@python -c 'import time; time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)' > /dev/null 2>&1 || (echo "Not supported python version. Read https://raiden-network.readthedocs.io/en/latest/macos_install_guide.html#macos-development-setup for details."; exit 1)
+endif
+
+GITHUB_ACCESS_TOKEN_ARG=
+ifdef GITHUB_ACCESS_TOKEN
+GITHUB_ACCESS_TOKEN_ARG=--build-arg GITHUB_ACCESS_TOKEN_FRAGMENT=$(GITHUB_ACCESS_TOKEN)@
+endif
+
+# architecture needs to be asked in docker because docker can be run on remote host to create binary for different architectures
+bundle-docker: ARCHITECTURE_TAG = $(shell docker run --rm python:3.7 uname -m)
+bundle-docker: ARCHIVE_TAG ?= v$(shell python setup.py --version)
+bundle-docker:
+	docker build -t pyinstallerbuilder --build-arg ARCHITECTURE_TAG=$(ARCHITECTURE_TAG) --build-arg ARCHIVE_TAG=$(ARCHIVE_TAG) $(GITHUB_ACCESS_TOKEN_ARG) -f docker/build.Dockerfile .
+	-(docker rm builder)
+	docker create --name builder pyinstallerbuilder
+	mkdir -p dist/archive
+	docker cp builder:/raiden/raiden-$(ARCHIVE_TAG)-linux-$(ARCHITECTURE_TAG).tar.gz dist/archive/raiden-$(ARCHIVE_TAG)-linux-$(ARCHITECTURE_TAG).tar.gz
+	docker rm builder
 
 bundle:
-	# pass RAIDEN_VERSION=<git version tag> to build a specific version
-	docker build -t raidenbundler --build-arg RAIDEN_VERSION=$(RAIDEN_VERSION) -f docker/build.Dockerfile docker
-	-(docker rm bundler)
-	docker run --name bundler --privileged -e ARCH=x86_64 -e APP=raiden -e LOWERAPP=raiden --workdir / --entrypoint /bin/bash raidenbundler -c 'source functions.sh && generate_appimage'
-	mkdir -p dist
-	docker cp bundler:/out/raiden--x86_64.AppImage dist/raiden--x86_64.AppImage
-	docker rm bundler
+	pyinstaller --noconfirm --clean raiden.spec
 
-test_bundle_docker := docker run --privileged --rm -v $(shell pwd)/dist:/data
-test_bundle_exe := /data/raiden--x86_64.AppImage --help
-test_bundle_test := grep -q "Usage: raiden"
 
-# test_bundle_distro <distro_name> <pre execution commands>
-define test_bundle_distro
-	################ 
-	# Testing "$(1)"
-	docker pull $(1)
-	${test_bundle_docker} $(1) sh -c \
-		'$(2) && \
-		${test_bundle_exe}' | ${test_bundle_test}
-	# Success "$(1)"
-	# ##############
-endef
+check-venv:
+	@python3 -c 'import sys; sys.exit(not (hasattr(sys, "real_prefix") or sys.base_prefix != sys.prefix))' \
+		|| (echo "It appears you're not working inside a venv / virtualenv\nIt's strongly recommended to install raiden into a virtual environment.\nSee the documentation for more details."; exit 1)
 
-test-bundle:
-	$(call test_bundle_distro,ubuntu:17.04,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,ubuntu:16.10,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,ubuntu:16.04,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,ubuntu:14.04,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,debian:8,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,debian:9,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 && dpkg -i --force-all *.deb)
-	$(call test_bundle_distro,base/archlinux,\
-		pacman -Syy && pacman --noconfirm -S fuse grep )
-	$(call test_bundle_distro,centos:7,yum install -y fuse-libs)
-	$(call test_bundle_distro,fedora:20,yum install -y fuse-libs)
-	$(call test_bundle_distro,fedora:21,yum install -y fuse-libs)
-	$(call test_bundle_distro,fedora:22,dnf install -y fuse-libs)
-	$(call test_bundle_distro,fedora:23,dnf install -y fuse-libs)
-	$(call test_bundle_distro,fedora:24,dnf install -y fuse-libs)
-	$(call test_bundle_distro,fedora:25,dnf install -y fuse-libs)
-	$(call test_bundle_distro,fedora:rawhide,dnf install -y fuse-libs)
-
-# test_bundle_distro <distro_name> <pre execution commands>
-define test_bundle_distro_fail
-	################ 
-	# Testing "$(1)"
-	docker pull $(1)
-	! ${test_bundle_docker} $(1) sh -c \
-		'$(2) && \
-		${test_bundle_exe}' | ${test_bundle_test}
-	# Not working: "$(1)"
-	################
-endef
-
-test-bundle-unsupported:
-	# not yet supported (version `GLIBC_2.14' not found):
-	$(call test_bundle_distro_fail,centos:5,yum install -y fuse-libs)
-	$(call test_bundle_distro_fail,centos:6,yum install -y fuse-libs)
-	$(call test_bundle_distro_fail,debian:7,\
-		apt-get update && apt-get install -y fuse && cd /tmp/ && \
-		apt-get download libglib2.0 libpcre3 && dpkg -i --force-all *.deb)
-
-release: clean
-	python setup.py sdist upload
-	python setup.py bdist_wheel upload
-
-dist: clean
-	python setup.py sdist
-	python setup.py bdist_wheel
-	ls -l dist
-
-install: clean
-	python setup.py install
-
-logging_settings = :info,contracts:debug
-mkfile_root := $(dir $(realpath $(lastword $(MAKEFILE_LIST))))
-
-stop-geth:
-	killall -15 geth
-
-blockchain-geth:
-	rm -f blockchain.log
-	./tools/startcluster.py
-
-deploy: compile
-	./tools/deploy.py	
+# Ensure pip-tools is installed
+check-pip-tools: check-venv
+	@command -v pip-compile > /dev/null 2>&1 || (echo "pip-tools is required. Installing." && python3 -m pip install $(shell grep pip-tools== requirements/requirements-dev.txt))

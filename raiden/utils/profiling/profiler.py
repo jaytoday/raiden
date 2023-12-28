@@ -1,17 +1,14 @@
-# -*- coding: utf-8 -*-
-from __future__ import print_function
-
 import contextlib
 import sys
 import threading
 import time
 from collections import OrderedDict, namedtuple
-from itertools import chain, izip_longest
+from itertools import chain, zip_longest
+from typing import Dict, List, Optional, Tuple
 
 import greenlet
 
-from raiden.utils.profiling.stack import get_trace_info, get_trace_from_frame
-
+from raiden.utils.profiling.stack import get_trace_from_frame, get_trace_info
 
 # TODO:
 #  - sys.callstats()
@@ -25,7 +22,7 @@ from raiden.utils.profiling.stack import get_trace_info, get_trace_from_frame
 #     - https://www.python.org/dev/peps/pep-0418/
 
 # this variable holds the global state of the profiler, while it is running
-_state = None
+_state: Optional["GlobalState"] = None
 
 # about the measurements:
 # - GreenletProfiler/YAPPI uses a configurable clock to get the time (wall or cpu)
@@ -42,38 +39,35 @@ _state = None
 
 # PEP-0418
 #        perf_counter = It does include time elapsed during sleep and is system-wide.
-try:
-    clock = time.perf_counter  # pylint: disable=no-member
-except:
-    clock = time.clock
+clock = time.perf_counter  # pylint: disable=no-member
 
 # info is used to store the function name/module/lineno
 # children is an OrderedDict with function id -> CallNode
 # parent is the node that resulted in this call
-CallNode = namedtuple('CallNode', ('info', 'children', 'parent'))
-MergeNode = namedtuple('MergeNode', ('info', 'children'))
+CallNode = namedtuple("CallNode", ("info", "children", "parent"))
+MergeNode = namedtuple("MergeNode", ("info", "children"))
 
 
 def _copy_call(call):
     call = dict(call)
 
-    call.setdefault('calls', 0)
+    call.setdefault("calls", 0)
     # wall time
-    call.setdefault('wall_enter_time', list())
-    call.setdefault('wall_exit_time', list())
+    call.setdefault("wall_enter_time", list())
+    call.setdefault("wall_exit_time", list())
     # wall time (when a switch happened)
-    call.setdefault('sleep_start_time', list())
-    call.setdefault('sleep_end_time', list())
+    call.setdefault("sleep_start_time", list())
+    call.setdefault("sleep_end_time", list())
     # wall time (when a subcall is made)
-    call.setdefault('subcall_enter_time', list())
-    call.setdefault('subcall_exit_time', list())
+    call.setdefault("subcall_enter_time", list())
+    call.setdefault("subcall_exit_time", list())
 
     return call
 
 
 def ensure_call(curr, call):
-    ''' Returns an existing entry of call or create a new one. '''
-    id_ = call['runtime_id']
+    """Returns an existing entry of call or create a new one."""
+    id_ = call["runtime_id"]
 
     if id_ not in curr.children:
         # XXX: do we have a leak with curr?
@@ -83,6 +77,9 @@ def ensure_call(curr, call):
 
 
 def ensure_thread_state(target, frame):
+    global _state
+    assert _state, "Global variable '_state' not set"
+
     if target not in _state:
         frame = frame
         trace = get_trace_from_frame(frame)
@@ -102,16 +99,16 @@ def zip_both(first, second):
 def calculate_metrics(info):
     info = dict(info)
 
-    wall_data = zip_both(info['wall_enter_time'], info['wall_exit_time'])
-    sleep_data = zip_both(info['sleep_start_time'], info['sleep_end_time'])
-    subcall_data = zip_both(info['subcall_enter_time'], info['subcall_exit_time'])
+    wall_data = zip_both(info["wall_enter_time"], info["wall_exit_time"])
+    sleep_data = zip_both(info["sleep_start_time"], info["sleep_end_time"])
+    subcall_data = zip_both(info["subcall_enter_time"], info["subcall_exit_time"])
 
-    accumulated, min_, max_ = 0, float('inf'), 0
+    accumulated, min_, max_ = 0, float("inf"), 0
     avg, count = None, None
 
     if wall_data:
-        for start, exit in wall_data:
-            run_time = exit - start
+        for start, exit_ in wall_data:
+            run_time = exit_ - start
             accumulated += run_time
             min_ = min(min_, run_time)
             max_ = max(max_, run_time)
@@ -122,45 +119,47 @@ def calculate_metrics(info):
 
     sleep = 0
     if sleep_data:
-        for start, exit in sleep_data:
-            sleep += exit - start
+        for start, exit_ in sleep_data:
+            sleep += exit_ - start
 
     subcall_time = 0
     if subcall_data:
-        for start, exit in subcall_data:
-            subcall_time += exit - start
+        for start, exit_ in subcall_data:
+            subcall_time += exit_ - start
 
     inline = 0
     if accumulated:
         inline = accumulated - subcall_time - sleep
 
-    info['sleep'] = sleep
-    info['accumulated'] = accumulated
-    info['subcall_time'] = subcall_time
-    info['inline'] = inline
-    info['min'] = min_
-    info['max'] = max_
-    info['avg'] = avg
-    info['profiled_calls'] = count
+    info["sleep"] = sleep
+    info["accumulated"] = accumulated
+    info["subcall_time"] = subcall_time
+    info["inline"] = inline
+    info["min"] = min_
+    info["max"] = max_
+    info["avg"] = avg
+    info["profiled_calls"] = count
 
     return info
 
 
 class GlobalState(dict):
-    ''' This class is responsable to store the state of a profiling session '''
+    """This class is responsable to store the state of a profiling session"""
+
     def __init__(self, *args, **kwargs):
-        super(GlobalState, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.last = None
 
 
-class ThreadState(object):
-    ''' This class is responsable to store the state of an execution thread,
+class ThreadState:
+    """This class is responsable to store the state of an execution thread,
     that can be a native thread, with a 1-to-1 mapping between userland and
     kernel space, or a light thread with a n-to-1, be it cooperative or not.
 
     This will store not trace every single line but the call's and return's in
     the code.
-    '''
+    """
+
     def __init__(self, name, trace):
         self.root = CallNode({}, OrderedDict(), None)  # the root node is empty
         self.calltree = self.root
@@ -176,58 +175,60 @@ class ThreadState(object):
 
     @property
     def total_accumulated(self):
-        ''' Returns the top most stack that has a wall time measurement '''
+        """Returns the top most stack that has a wall time measurement"""
 
         accumulated, top_depth = 0.0, None
         for depth, node in self.depthorder():
             if accumulated and top_depth != depth:
                 return accumulated
 
-            if node['accumulated']:
+            if node["accumulated"]:
                 top_depth = depth
-                accumulated += node['accumulated']
+                accumulated += node["accumulated"]
+
+        return accumulated
 
     def call_enter(self, call, now):
         node = ensure_call(self.curr, call)
 
-        node.info['calls'] += 1
-        node.info['wall_enter_time'].append(now)
+        node.info["calls"] += 1
+        node.info["wall_enter_time"].append(now)
 
         # this could be the root node, but that is not a problem
-        self.curr.info['subcall_enter_time'].append(now)
+        self.curr.info["subcall_enter_time"].append(now)
 
         self.curr = node
 
-    def call_exit(self, call, now):
+    def call_exit(self, call, now):  # pylint: disable=unused-argument
         info = self.curr.info
 
-        info['wall_exit_time'].append(now)
-        if len(info['wall_exit_time']) > len(info['wall_enter_time']):
-            info['wall_enter_time'].append(None)
+        info["wall_exit_time"].append(now)
+        if len(info["wall_exit_time"]) > len(info["wall_enter_time"]):
+            info["wall_enter_time"].append(None)
 
         parent_info = self.curr.parent.info
-        parent_info['subcall_exit_time'].append(now)
-        if len(parent_info['subcall_exit_time']) > len(parent_info['subcall_enter_time']):
-            parent_info['subcall_enter_time'].append(None)
+        parent_info["subcall_exit_time"].append(now)
+        if len(parent_info["subcall_exit_time"]) > len(parent_info["subcall_enter_time"]):
+            parent_info["subcall_enter_time"].append(None)
 
         self.curr = self.curr.parent
 
     def switch_enter(self, now):
-        assert self.root != self.curr, 'switch_enter must be called on a initialized ThreadState'
+        assert self.root != self.curr, "switch_enter must be called on a initialized ThreadState"
 
         info = self.curr.info
-        info['sleep_start_time'].append(now)
+        info["sleep_start_time"].append(now)
 
     def switch_exit(self, now):
-        assert self.root != self.curr, 'switch_enter must be called on a initialized ThreadState'
+        assert self.root != self.curr, "switch_enter must be called on a initialized ThreadState"
 
         info = self.curr.info
-        info['sleep_end_time'].append(now)
-        if len(info['sleep_end_time']) > len(info['sleep_start_time']):
-            info['sleep_start_time'].append(None)
+        info["sleep_end_time"].append(now)
+        if len(info["sleep_end_time"]) > len(info["sleep_start_time"]):
+            info["sleep_start_time"].append(None)
 
     def depthorder(self):
-        ''' Returns a generator that does stack traversal stepping in the depth order. '''
+        """Returns a generator that does stack traversal stepping in the depth order."""
         iterators = [
             (1, self.root.children[key])
             for key in self.root.children  # the root node doesnt have data
@@ -240,10 +241,7 @@ class ThreadState(object):
             yield depth, info
 
             if node.children:
-                children = [
-                    (depth + 1, node.children[key])
-                    for key in node.children
-                ]
+                children = [(depth + 1, node.children[key]) for key in node.children]
 
                 # this is one level deeper, to the children need to go to the
                 # end of the iterators, also the order should be from newest to
@@ -251,11 +249,8 @@ class ThreadState(object):
                 iterators.extend(children)
 
     def traverse(self):
-        ''' Returns a generator that does stack travesal using order of appearance (inorder). '''
-        iterators = [
-            (1, self.root.children[key])
-            for key in self.root.children
-        ]
+        """Returns a generator that does stack travesal using order of appearance (inorder)."""
+        iterators = [(1, self.root.children[key]) for key in self.root.children]
 
         while iterators:
             depth, node = iterators.pop()
@@ -264,10 +259,7 @@ class ThreadState(object):
             yield depth, info
 
             if node.children:
-                children = [
-                    (depth + 1, node.children[key])
-                    for key in node.children
-                ]
+                children = [(depth + 1, node.children[key]) for key in node.children]
 
                 # the newest need to be in the end because we use pop()
                 iterators.extend(children[::-1])
@@ -275,6 +267,7 @@ class ThreadState(object):
 
 def thread_profiler(frame, event, arg):
     global _state
+    assert _state, "Global variable '_state' not set"
 
     now = clock()  # measure once and reuse it
 
@@ -285,29 +278,32 @@ def thread_profiler(frame, event, arg):
         current_state.context_switch += 1
         _state.last = current_state
 
-    if event in ('c_call', 'c_return', 'c_exception'):
+    if event in ("c_call", "c_return", "c_exception"):
         # The frame is of the python callee
         call = {
-            'function': arg.__name__,
-            'module': arg.__module__ or '__builtin__',
-            'lineno': '',
-            'abs_path': '',
-            'filename': '',
-            'runtime_id': id(arg),
+            "function": arg.__name__,
+            "module": arg.__module__ or "__builtin__",
+            "lineno": "",
+            "abs_path": "",
+            "filename": "",
+            "runtime_id": id(arg),
         }
     else:
         call = get_trace_info(frame)
 
-    if event in ('call', 'c_call'):
+    if event in ("call", "c_call"):
         current_state.call_enter(call, now)
-    elif event in ('return', 'c_return', 'c_exception'):
+    elif event in ("return", "c_return", "c_exception"):
         current_state.call_exit(call, now)
 
     return thread_profiler
 
 
 def greenlet_profiler(event, args):
-    if event in ('switch', 'throw'):  # both events are in the target context
+    global _state
+    assert _state, "Global variable '_state' not set"
+
+    if event in ("switch", "throw"):  # both events are in the target context
         now = clock()
 
         try:
@@ -325,11 +321,12 @@ def greenlet_profiler(event, args):
         target_state = ensure_thread_state(target, frame)
 
         origin_state.switch_enter(now)  # origin is entering the "sleep" state
-        target_state.switch_exit(now)   # target might be leaving the "sleep"
+        target_state.switch_exit(now)  # target might be leaving the "sleep"
 
 
 def start_profiler():
     global _state
+    assert _state, "Global variable '_state' not set"
 
     _state = GlobalState()
 
@@ -363,17 +360,17 @@ def profile():
 
 
 def zip_outter_join(equal, *element_list):
-    ''' Returns a list with equal elements grouped, were elements considered
-    equal will be in the same tuple '''
+    """Returns a list with equal elements grouped, were elements considered
+    equal will be in the same tuple"""
 
     if not callable(equal):
-        raise ValueError('equal must be a callable')
+        raise ValueError("equal must be a callable")
 
     length = len(element_list)
-    result = [list() for __ in range(length)]
+    result: List[List] = [list() for __ in range(length)]
 
     # do it all in one swipe
-    for iteration in izip_longest(*element_list):
+    for iteration in zip_longest(*element_list):
         # the done flag is set when the element is used, this can happen either
         # because the element was equal to another one or because it is the
         # element turn in the search
@@ -405,63 +402,61 @@ def zip_outter_join(equal, *element_list):
 
 
 def merge_info(*allinfo):
-    def _info_to_list(infodata, field):
+    def _info_to_list(infodata, field):  # pylint: disable=unused-argument
         iterable = chain.from_iterable(info[field] for info in allinfo)
         return list(iterable)
 
-    allinfo = list(allinfo)
+    allinfo_copy = list(allinfo)
     # guarantee that the metrics are calculated
-    for pos, info in enumerate(allinfo):
-        allinfo[pos] = calculate_metrics(info)
+    for pos, info in enumerate(allinfo_copy):
+        allinfo_copy[pos] = calculate_metrics(info)
 
-    result = dict(allinfo[0])
+    result = dict(allinfo_copy[0])
 
     # keep this data in case we need to call calculate_metrics again, preserve the order
-    result['calls'] = sum(info['calls'] for info in allinfo)
+    result["calls"] = sum(info["calls"] for info in allinfo_copy)
 
-    result['wall_enter_time'] = _info_to_list(allinfo, 'wall_enter_time')
-    result['wall_exit_time'] = _info_to_list(allinfo, 'wall_exit_time')
-    result['sleep_start_time'] = _info_to_list(allinfo, 'sleep_start_time')
-    result['sleep_end_time'] = _info_to_list(allinfo, 'sleep_end_time')
-    result['subcall_enter_time'] = _info_to_list(allinfo, 'subcall_enter_time')
-    result['subcall_exit_time'] = _info_to_list(allinfo, 'subcall_exit_time')
+    result["wall_enter_time"] = _info_to_list(allinfo_copy, "wall_enter_time")
+    result["wall_exit_time"] = _info_to_list(allinfo_copy, "wall_exit_time")
+    result["sleep_start_time"] = _info_to_list(allinfo_copy, "sleep_start_time")
+    result["sleep_end_time"] = _info_to_list(allinfo_copy, "sleep_end_time")
+    result["subcall_enter_time"] = _info_to_list(allinfo_copy, "subcall_enter_time")
+    result["subcall_exit_time"] = _info_to_list(allinfo_copy, "subcall_exit_time")
 
-    result['sleep'] = sum(info['sleep'] for info in allinfo)
-    result['accumulated'] = sum(info['accumulated'] for info in allinfo)
-    result['subcall_time'] = sum(info['subcall_time'] for info in allinfo)
-    result['inline'] = sum(info['inline'] for info in allinfo)
-    result['min'] = min(info['min'] for info in allinfo)
-    result['max'] = max(info['max'] for info in allinfo)
+    result["sleep"] = sum(info["sleep"] for info in allinfo_copy)
+    result["accumulated"] = sum(info["accumulated"] for info in allinfo_copy)
+    result["subcall_time"] = sum(info["subcall_time"] for info in allinfo_copy)
+    result["inline"] = sum(info["inline"] for info in allinfo_copy)
+    result["min"] = min(info["min"] for info in allinfo_copy)
+    result["max"] = max(info["max"] for info in allinfo_copy)
 
     # if one element is None convert the result to None
-    if all(info['profiled_calls'] for info in allinfo):
-        result['profiled_calls'] = sum(info['profiled_calls'] for info in allinfo)
+    if all(info["profiled_calls"] for info in allinfo_copy):
+        result["profiled_calls"] = sum(info["profiled_calls"] for info in allinfo_copy)
     else:
-        result['profiled_calls'] = None
+        result["profiled_calls"] = None
 
-    if all(info['avg'] for info in allinfo):
-        result['avg'] = sum(info['avg'] for info in allinfo) / len(allinfo)
+    if all(info["avg"] for info in allinfo_copy):
+        result["avg"] = sum(info["avg"] for info in allinfo_copy) / len(allinfo_copy)
     else:
-        result['avg'] = None
+        result["avg"] = None
 
     return result
 
 
 def merge_threadstates(*threadstates):
-    ''' Merge the profile data from first and second, the result will _not_ be
+    """Merge the profile data from first and second, the result will _not_ be
     a ThreadState
-    '''
+    """
 
     def equal(first_node, second_node):
-        runtime_id = first_node.info['runtime_id'] == second_node.info['runtime_id']
-        module = first_node.info['module'] == second_node.info['module']
-        function = first_node.info['function'] == second_node.info['function']
+        runtime_id = first_node.info["runtime_id"] == second_node.info["runtime_id"]
+        module = first_node.info["module"] == second_node.info["module"]
+        function = first_node.info["function"] == second_node.info["function"]
 
         return (module and function) or runtime_id
 
-    tree = [
-        (1, {}, [state.calltree for state in threadstates])
-    ]
+    tree: List[Tuple[int, Dict, List]] = [(1, {}, [state.calltree for state in threadstates])]
 
     while tree:
         depth, curr, callnodes = tree.pop()
@@ -469,10 +464,7 @@ def merge_threadstates(*threadstates):
         yield depth, curr
 
         # CallNode.children is an OrderedDict
-        children = [
-            node.children.values()
-            for node in callnodes
-        ]
+        children = [list(node.children.values()) for node in callnodes]
 
         # XXX: create a version of outter_join were the order is not essential,
         # so the first element is compared with all others and if there are any
@@ -480,7 +472,7 @@ def merge_threadstates(*threadstates):
 
         extend_search = []
         for nodes_joined in zip_outter_join(equal, *children):
-            nodes_joined = filter(None, nodes_joined)
+            nodes_joined = [_f for _f in nodes_joined if _f]
             info_merged = merge_info(*(node.info for node in nodes_joined))
             extend_search.append((depth + 1, info_merged, nodes_joined))
 
@@ -490,39 +482,39 @@ def merge_threadstates(*threadstates):
 
 def print_info(depth, info):
     def _line(recursion):
-        line = list(' ' * (recursion + 1))
-        line[7::7] = len(line[7::7]) * '.'
-        return ''.join(line)
+        line = list(" " * (recursion + 1))
+        line[7::7] = len(line[7::7]) * "."
+        return "".join(line)
 
-    inline = ' ' * 8
-    accumulated = ' ' * 8
-    sleep = ' ' * 8
+    inline = " " * 8
+    accumulated = " " * 8
+    sleep = " " * 8
 
-    if 'accumulated' in info:
-        accumulated = '{:>8.6f}'.format(info['accumulated'])
+    if "accumulated" in info:
+        accumulated = "{:>8.6f}".format(info["accumulated"])
 
-        if 'inline' in info:
-            inline = '{:>8.6f}'.format(info['inline'])
+        if "inline" in info:
+            inline = "{:>8.6f}".format(info["inline"])
 
-    if 'sleep' in info:
-        sleep = '{:>8.6f}'.format(info['sleep'])
+    if "sleep" in info:
+        sleep = "{:>8.6f}".format(info["sleep"])
 
     align = _line(depth)
-    line = '{accumulated} {inline} {sleep} {align}{module}.{function}:{line} [{calls}x]'.format(
+    line = "{accumulated} {inline} {sleep} {align}{module}.{function}:{line} [{calls}x]".format(
         align=align,
         inline=inline,
         accumulated=accumulated,
         sleep=sleep,
-        module=info.get('module', ''),
-        function=info.get('function', ''),
-        line=info.get('lineno', ''),
-        calls=info.get('calls', ''),
+        module=info.get("module", ""),
+        function=info.get("function", ""),
+        line=info.get("lineno", ""),
+        calls=info.get("calls", ""),
     )
     print(line)
 
 
 def print_info_tree(depth_info):
-    print('   total   inline    sleep')
+    print("   total   inline    sleep")
 
     # the calltree is ordered by stack height and the by call order
     for depth, info in depth_info:
@@ -533,24 +525,22 @@ def filter_fast(depth_info):
     depth_info = list(depth_info)
 
     # filters
-    acc_max, acc_min = 0, float('inf')
-    inline_max, inline_min = 0, float('inf')
+    acc_max, acc_min = 0, float("inf")
+    inline_max, inline_min = 0, float("inf")
 
-    for depth, info in depth_info:
-        acc_max = max(info.get('accumulated', 0), acc_max)
-        acc_min = min(info.get('accumulated', float('inf')), acc_min)
-        inline_max = max(info.get('inline', 0), inline_max)
-        inline_min = min(info.get('inline', float('inf')), inline_min)
+    for _depth, info in depth_info:
+        acc_max = max(info.get("accumulated", 0), acc_max)
+        acc_min = min(info.get("accumulated", float("inf")), acc_min)
+        inline_max = max(info.get("inline", 0), inline_max)
+        inline_min = min(info.get("inline", float("inf")), inline_min)
 
     for depth, info in depth_info:
         yield depth, info
 
 
 def print_thread_profile(thread_state):
-    header = '{} [context_switches: {}, total time: {:>8.6f}]'.format(
-        thread_state.name,
-        thread_state.context_switch,
-        thread_state.total_accumulated,
+    header = "{} [context_switches: {}, total time: {:>8.6f}]".format(
+        thread_state.name, thread_state.context_switch, thread_state.total_accumulated
     )
     print(header)
     print_info_tree(thread_state.traverse())
@@ -558,6 +548,7 @@ def print_thread_profile(thread_state):
 
 def print_merged():
     global _state
+    assert _state, "Global variable '_state' not set"
 
     merged = merge_threadstates(*_state.values())
     print_info_tree(filter_fast(merged))
@@ -565,14 +556,15 @@ def print_merged():
 
 def print_all_threads():
     global _state
+    assert _state, "Global variable '_state' not set"
 
     for thread_state in _state.values():
         print_thread_profile(thread_state)
 
     print()
-    print('total - time spent to execute the function')
-    print('inline - time spent in the function itself')
-    print('sleep - time waiting in a greenlet.switch')
+    print("total - time spent to execute the function")
+    print("inline - time spent in the function itself")
+    print("sleep - time waiting in a greenlet.switch")
     print()
-    print('total and inline do not include sleep')
-    print('total include subcalls while inline does not')
+    print("total and inline do not include sleep")
+    print("total include subcalls while inline does not")

@@ -26,12 +26,15 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-wheel-metadata/
+
+# Local dev-requirements
+requirements/requirements-local.txt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
 
 # Installer logs
 pip-log.txt
@@ -46,9 +49,15 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *,cover
+.pytest_cache/
+mypy-out.txt
+.hypothesis/
 
 # Pyenv
 .python-version
+
+# mypy
+.mypy_cache
 
 # Translations
 *.mo
@@ -63,10 +72,19 @@ docs/_build/
 # PyBuilder
 target/
 
-# truffle related
-truffle/.babel.json
-truffle/environments/development/contracts/
-truffle/.bash_history
-
 # never check in .static-abi.json files
 *.static-abi.json
+
+# editors
+.idea
+.vscode
+
+# Our logs
+raiden-debug_*.log
+
+# direnv virtual envs
+.direnv
+.envrc
+
+# venvs
+venv/

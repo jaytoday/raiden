@@ -1,0 +1,1062 @@
+version: 2.1
+
+templates:
+  filter-tag-templates: &only-tagged-version-filter
+    tags:
+      only: /^v\d+\.\d+\.\d+((?:\-|\.)?(a(?:lpha)?|b(?:eta)?|rc|dev)(?:\-|\.)?\d*)?$/
+    branches:
+      ignore: /.*/
+
+  parameter-templates: &parameter-templates
+    py-version: &py-version-template
+      description: "python version to be used in the executor"
+      default: "3.7"
+      type: string
+    resource:
+      description: "resource type for underlying VM"
+      default: "medium"
+      type: enum
+      enum: ["small", "medium", "medium+", "large", "xlarge"]
+    transport-layer:
+      description: "transmission protocol used, matrix"
+      default: "matrix"
+      type: enum
+      enum: ["matrix"]
+    environment-type:
+      description: "Environment configuration to be used."
+      default: "production"
+      type: enum
+      enum: ["production", "development"]
+    blockchain-type:
+      description: "blockchain type client passed to test run if needed"
+      default: "geth"
+      type: enum
+      enum: ["geth", "parity"]
+    additional-args:
+      description: "additional arguments to run smoketest if needed"
+      default: ""
+      type: string
+
+  default-environment: &default-environment
+    BENCHMARK_HOST: 'circleci'
+    GETH_URL_LINUX: 'https://gethstore.blob.core.windows.net/builds/geth-linux-amd64-1.10.1-c2d2f4ed.tar.gz'
+    GETH_MD5_LINUX: '5e18a027f9919ed9ba08abd15c169f61'
+    GETH_URL_MACOS: 'https://gethstore.blob.core.windows.net/builds/geth-darwin-amd64-1.10.1-c2d2f4ed.tar.gz'
+    GETH_MD5_MACOS: '50270c1205c0a27457d9a8b182670c83'
+    GETH_VERSION: '1.10.1'
+    PARITY_URL_LINUX: 'https://github.com/openethereum/openethereum/releases/download/v3.1.0/openethereum-linux-v3.1.0.zip'
+    PARITY_SHA256_LINUX: '8dd753058e5db77ffaede5a53418005f9c8133212448e11df9169a651cdac997'
+    PARITY_URL_MACOS: 'https://github.com/openethereum/openethereum/releases/download/v3.1.0/openethereum-macos-v3.1.0.zip'
+    PARITY_SHA256_MACOS: 'f41cb1f49727ccf09e4f34b964fdfa9ad3802a046f6acd6c349a41020cdcf1c7'
+    PARITY_VERSION: 'v3.1.0'
+    SOLC_URL_LINUX: 'https://github.com/ethereum/solidity/releases/download/v0.6.3/solc-static-linux'
+    SOLC_VERSION: 'v0.6.3'
+    PYENV_PYTHON_VERSION_38: '3.8.6'
+    PYENV_PYTHON_VERSION_37: '3.7.9'
+
+
+orbs:
+  shellcheck: circleci/shellcheck@1.3.16
+
+executors:
+  docker:
+    parameters:
+      py-version:
+        <<: *py-version-template
+      resource:
+        description: "resource type for underlying VM"
+        default: "medium"
+        type: enum
+        enum: ["small", "medium", "medium+", "large", "xlarge"]
+    working_directory: ~/raiden
+    docker:
+      - image: circleci/python:<< parameters.py-version >>
+    resource_class: << parameters.resource >>
+    environment:
+      <<: *default-environment
+      PYTHON_VERSION_SHORT: << parameters.py-version >>
+
+  macos:
+    macos:
+      xcode: "12.3.0"
+    # The macos builder doesn't support different python versions but we define the parameter
+    # anyway to be compatible with the shared step definitions
+    parameters:
+      py-version:
+        <<: *py-version-template
+    working_directory: ~/raiden
+    environment:
+      <<: *default-environment
+      PYTHON_VERSION_SHORT: << parameters.py-version >>
+
+
+commands:
+  conditional-skip:
+    description: "Check commit message for skip tag and skip job if found"
+    steps:
+      - run:
+          name: Skip Tag Check
+          command: source .circleci/conditional_skip.sh
+
+  config-path:
+    description: "set environment variables and change path to use venv"
+    steps:
+      - run:
+          name: Configuring PATH
+          command: |
+            echo 'export PATH=~/venv-${PYTHON_VERSION_SHORT}/bin:~/.local/bin:${PATH}' >> ${BASH_ENV}
+            echo 'export CI_RAIDEN_VERSION=$(python3 setup.py --version)' >> ${BASH_ENV}
+
+  checkout-and-persist:
+    steps:
+      - checkout
+      # This needs to be done here in order for the .egg-info directory to be included in the
+      # workspace. Luckily we don't need a virtualenv for this step.
+      - run:
+          name: Generate .egg-info
+          command: python setup.py egg_info
+      - persist_to_workspace:
+          root: "~"
+          paths:
+          - raiden
+
+  attach-and-link:
+    parameters:
+      py-version:
+        <<: *py-version-template
+    steps:
+      - attach_workspace:
+          at: "~"
+      - run:
+          name: Link platform local binaries
+          command: |
+            export OS_NAME=$(uname -s | sed s/Darwin/macos/ | tr '[:lower:]' '[:upper:]')
+            rm -rf ~/.local
+            [[ -d ~/.local-${OS_NAME} ]] && ln -sfn ~/.local-${OS_NAME} ~/.local || true
+            [[ -d ~/venv-<< parameters.py-version >>-${OS_NAME} ]] && ln -sfn ~/venv-<< parameters.py-version >>-${OS_NAME} ~/venv-<< parameters.py-version >> || true
+
+  prepare-system:
+    steps:
+      - run:
+          name: Get cache key
+          command: |
+            echo ${GETH_VERSION} > /tmp/geth-version
+            echo ${PARITY_VERSION} > /tmp/parity-version
+            echo ${SOLC_VERSION} > /tmp/solc-version
+      - restore_cache:
+          key: system-deps-v9-{{ arch }}-geth-{{ checksum "/tmp/geth-version" }}-parity-{{ checksum "/tmp/parity-version" }}-solc-{{ checksum "/tmp/solc-version" }}
+      - attach-and-link
+      - run:
+          name: Preparing environment
+          command: |
+            echo "export OS_NAME=$(uname -s | sed s/Darwin/macos/ | tr '[:lower:]' '[:upper:]')" >> ${BASH_ENV}
+            echo "SHA: ${CIRCLE_SHA1}"
+            echo "TAG: ${CIRCLE_TAG}"
+      - run:
+          name: Installing System Dependencies
+          command: |
+            export LOCAL_BASE=~/.local-${OS_NAME}
+            .circleci/fetch_geth_parity_solc.sh
+            ln -sfn ${LOCAL_BASE} ~/.local
+      - save_cache:
+          key: system-deps-v9-{{ arch }}-geth-{{ checksum "/tmp/geth-version" }}-parity-{{ checksum "/tmp/parity-version" }}-solc-{{ checksum "/tmp/solc-version" }}
+          paths:
+            - "~/.local-LINUX"
+            - "~/.local-MACOS"
+      - run:
+          name: Fetch PR Base Commit
+          command: source .circleci/fetch_pr_base_commit.sh
+      - persist_to_workspace:
+          root: "~"
+          paths:
+            - ".local-*"
+
+  prepare-python:
+    parameters:
+      py-version:
+        <<: *py-version-template
+    steps:
+      - run:
+          name: Preparing environment
+          command: |
+            export OS_NAME=$(uname -s | sed s/Darwin/macos/ | tr '[:lower:]' '[:upper:]')
+            echo "export OS_NAME=$OS_NAME" >> ${BASH_ENV}
+            if [[ ${OS_NAME} == "MACOS" ]]; then
+              echo "export PYENV_ROOT=~/.local-MACOS/.pyenv" >> ${BASH_ENV}
+              if [[ $PYTHON_VERSION_SHORT == 3.8 ]]; then
+                export PYENV_PYTHON_VERSION=$PYENV_PYTHON_VERSION_38
+              elif [[ $PYTHON_VERSION_SHORT == 3.7 ]]; then
+                export PYENV_PYTHON_VERSION=$PYENV_PYTHON_VERSION_37
+              else
+                exit 1
+              fi
+              echo "export PYENV_PYTHON_VERSION=$PYENV_PYTHON_VERSION" >> ${BASH_ENV}
+            fi
+            echo "SHA: ${CIRCLE_SHA1}"
+            echo "TAG: ${CIRCLE_TAG}"
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - restore_cache:
+          keys:
+          - system-deps-pyenv-v5-{{ arch }}-<< parameters.py-version >>
+      - run:
+          name: Installing Python on MacOS
+          command: |
+            if [[ ${OS_NAME} == "MACOS" ]]; then
+              if [[ ! -x $PYENV_ROOT ]]; then
+                git clone https://github.com/pyenv/pyenv.git $PYENV_ROOT
+              fi
+              export PATH=${PYENV_ROOT}/bin:${PATH}
+              env PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install $PYENV_PYTHON_VERSION -sv
+            fi
+      - save_cache:
+          key: system-deps-pyenv-v5-{{ arch }}-<< parameters.py-version >>
+          paths:
+          - "~/.local-MACOS/.pyenv"
+      - restore_cache:
+          key: pip-cache-v2-{{ arch }}-<< parameters.py-version >>
+      - restore_cache:
+          keys:
+          - python-deps-v8-{{ arch }}-<< parameters.py-version >>-{{ checksum "requirements/requirements-ci.txt" }}
+          - python-deps-v8-{{ arch }}-<< parameters.py-version >>-
+      - run:
+          name: Creating virtualenv
+          command: |
+            if [[ ${OS_NAME} == "MACOS" ]]; then
+              export PATH=${PYENV_ROOT}/bin:${PATH}
+              eval "$(pyenv init -)"
+              eval "$(pyenv init --path)"
+              pyenv local $PYENV_PYTHON_VERSION
+              echo "Detected MacOS: Using pyenv Python at $(pyenv which python<< parameters.py-version >>)"
+            fi
+            if [ ! -x ~/venv-<< parameters.py-version >>/bin/python ]; then
+              echo "Virtual env not found. Creating virtual env using $(python<< parameters.py-version >> --version)."
+              python<< parameters.py-version >> -m venv ~/venv-<< parameters.py-version >>-${OS_NAME}
+            fi
+            ln -nfs ~/venv-<< parameters.py-version >>-${OS_NAME} ~/venv-<< parameters.py-version >>
+            echo 'export VENV_PATH="$HOME/venv-<< parameters.py-version >>"' >> ${BASH_ENV}
+      - config-path
+      - run:
+          name: Installing dependencies
+          command: |
+            . ${VENV_PATH}/bin/activate
+            pip config set global.progress_bar off
+            pip install -U pip wheel pip-tools
+            pushd requirements
+            pip-sync requirements-ci.txt _raiden-dev.txt
+            popd
+      - save_cache:
+          key: python-deps-v8-{{ arch }}-<< parameters.py-version >>-{{ checksum "requirements/requirements-ci.txt" }}
+          paths:
+          - "~/venv-<< parameters.py-version >>-LINUX"
+          - "~/venv-<< parameters.py-version >>-MACOS"
+      - save_cache:
+          key: pip-cache-v2-{{ arch }}-<< parameters.py-version >>
+          paths:
+          - "~/.cache/pip"
+      - persist_to_workspace:
+          root: "~"
+          paths:
+          - venv-<< parameters.py-version >>-*
+          - .local-MACOS/.pyenv/versions/
+
+jobs:
+  # This job exists to generate the `*.egg-info` metadata.
+  #
+  # From CircleCI's docs:
+  #
+  # > If multiple concurrent jobs persist the same filename then attaching
+  # > the workspace will error.
+  # [https://circleci.com/docs/2.0/configuration-reference/#attach_workspace]
+  #
+  # This is necessary otherwise neither `python setup.py install` nor `pip
+  # install -e .` could be executed in parallel jobs.
+  checkout:
+    executor: docker
+    steps:
+      - checkout-and-persist
+
+  prepare-system-linux:
+    executor: docker
+    steps:
+      - prepare-system
+
+  prepare-system-macos:
+    executor: macos
+    steps:
+      - prepare-system
+
+  prepare-python-linux:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+
+    steps:
+      - prepare-python:
+          py-version: << parameters.py-version >>
+
+  prepare-python-macos:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor: macos
+
+    steps:
+      - prepare-python
+
+  lint:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+      resource: xlarge
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - config-path
+      - run:
+          name: Validate CircleCI Config
+          command: python tools/check_circleci_config.py
+      - run:
+          name: Run Lint
+          command: make lint
+
+  build-docs:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+
+      - run:
+          name: Install docs requirements
+          command: pip-sync requirements/requirements-docs.txt
+      - run:
+          name: Build documentation
+          command: make docs
+
+  smoketest:
+    parameters:
+      <<: *parameter-templates
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+
+    environment:
+      RAIDEN_TESTS_SYNAPSE_LOGS_DIR: /tmp/synapse-logs
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: Set Options
+          command: |
+            set -e
+            set -x
+      - run:
+          name: Running Raiden Smoketest with << parameters.transport-layer >>, environment << parameters.environment-type >> on ethereum client << parameters.blockchain-type >>
+          command: raiden --environment-type=<< parameters.environment-type >> smoketest --eth-client << parameters.blockchain-type >> << parameters.additional-args >> --report-path /tmp/smoketest.log
+
+      - store_artifacts:
+          path: /tmp/smoketest.log
+          destination: smoketest-logs
+
+  scenario-player-integration-test:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: Checkout Scenario Player
+          command: |
+            cd ~
+            git clone https://github.com/raiden-network/scenario-player.git
+      - run:
+          name: Install dependencies
+          command: |
+            cd ~
+            pip install ~/scenario-player
+            pip install -Ue ~/raiden
+      - run:
+          name: Set Locale
+          command: |
+            echo 'export LANGUAGE=en_US.UTF-8' >> ${BASH_ENV}
+            echo 'export LANG=en_US.UTF-8' >> ${BASH_ENV}
+            echo 'export LC_ALL=en_US.UTF-8' >> ${BASH_ENV}
+            locale-gen en_US.UTF-8
+            sudo dpkg-reconfigure locales
+      - run:
+          name: Run Unit Tests
+          command: |
+            cd ~/scenario-player
+            pytest --rootdir . tests
+
+  test:
+    parameters:
+      <<: *parameter-templates
+      test-type:
+        description: "type of test"
+        type: enum
+        enum: ["fuzz", "integration", "mocked", "unit"]
+      parallelism:
+        description: "number of containers to be used in parallel for this test"
+        default: 1
+        type: integer
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+      resource: << parameters.resource >>
+
+    environment:
+      RAIDEN_TESTS_SYNAPSE_BASE_DIR: /home/circleci/.cache/synapse
+      RAIDEN_TESTS_SYNAPSE_LOGS_DIR: /tmp/synapse-logs
+      RAIDEN_TESTS_LOGSDIR: /tmp/tests/logs
+
+    parallelism: << parameters.parallelism >>
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - restore_cache:
+          key: ethash-v2-{{ checksum "~/.local/bin/geth" }}
+      - restore_cache:
+          keys:
+            - synapse-keys-v2
+      - run:
+          name: Select tests
+          command: .circleci/select_tests.sh "raiden/tests/<< parameters.test-type >>" "<< parameters.blockchain-type >>" << parameters.additional-args >>
+
+      - run:
+          name: Run tests
+          command: |
+            .circleci/run_tests.sh "test-reports/test-<< parameters.test-type >>-<< parameters.transport-layer >>-<< parameters.py-version >>" "<< parameters.blockchain-type >>" "<< parameters.test-type >>" << parameters.additional-args >>
+
+      - save_cache:
+          key: ethash-v2-{{ checksum "~/.local/bin/geth" }}
+          paths:
+          - "~/.ethash"
+
+      - save_cache:
+          key: synapse-keys-v2
+          paths:
+            - "~/.cache/synapse"
+
+      - store_test_results:
+          path: test-reports
+
+      - run:
+          name: Compress the logs to seed up the CI (upload can be very slow)
+          when: always
+          command: |
+            files=()
+            for f in /tmp/tests/logs test-reports /tmp/synapse-logs; do
+              if [ -e "$f" ]; then
+                files+=("$f")
+              fi
+            done
+
+            mkdir /tmp/artifacts
+            tar cfz /tmp/artifacts/test-logs-$CIRCLE_PR_NUMBER-$CIRCLE_NODE_INDEX.tar.gz "${files[@]}"
+
+      - store_artifacts:
+          path: /tmp/artifacts
+
+  benchmark:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: << parameters.py-version >>
+
+    environment:
+      RAIDEN_TESTS_SYNAPSE_BASE_DIR: /home/circleci/.cache/synapse
+      RAIDEN_TESTS_SYNAPSE_LOGS_DIR: /tmp/synapse-logs
+      RAIDEN_TESTS_LOGSDIR: /tmp/tests/logs
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: Run benchmarks
+          command: |
+            python -m gevent.monkey --module pytest raiden/tests/benchmark/ -v --codespeed-url https://speed.metrics.brainbot.com
+
+  finalize:
+    executor:
+      name: docker
+      py-version: "3.7"
+    steps:
+      - run:
+          command: "true"
+
+  build-binary-linux:
+    parameters:
+      py-version:
+        <<: *py-version-template
+      resource:
+        description: "resource type for underlying VM"
+        default: "medium"
+        type: enum
+        enum: ["small", "medium", "medium+", "large", "xlarge"]
+      remote-host:
+        description: "name of the arm server"
+        default: ""
+        type: enum
+        enum: ["", "armv7", "armv8"]
+      architecture:
+        description: "defines the architecture for which the binary is built"
+        default: "x86_64"
+        type: enum
+        enum: ["x86_64", "armv7l", "aarch64"]
+
+
+    executor:
+      name: docker
+      py-version: "3.7"
+      resource: << parameters.resource >>
+
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "7b:c7:3d:f7:ff:1a:2b:8e:2d:18:93:be:c6:7b:b0:7c"
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - when:
+          condition: << parameters.remote-host >>
+          steps:
+            - run:
+                name: "set remote docker host"
+                command: echo 'export DOCKER_HOST=localhost:23760' >> ${BASH_ENV}
+            - run:
+                name: SSH Port Forwarding To ARM Server
+                command: |
+                  ssh -f -N -L 127.0.0.1:23760:localhost:2376 ci@<< parameters.remote-host >>.ci.raiden.network -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+      - unless:
+          condition: << parameters.remote-host >>
+          steps:
+            - setup_remote_docker:
+                docker_layer_caching: true
+      - run:
+          name: Build Linux Binary
+          command: |
+            source .circleci/get_archive_tag.sh
+            make bundle-docker
+            echo ${RELEASE_TYPE}/raiden-${ARCHIVE_TAG}-linux-<<parameters.architecture>>.tar.gz > dist/archive/_LATEST-${RELEASE_TYPE}-linux-<<parameters.architecture>>.txt
+      - run:
+          name: Test if Binary can be launched
+          command: |
+            tar -C /tmp -xf dist/archive/raiden-${ARCHIVE_TAG}-linux-<<parameters.architecture>>.tar.gz
+            /tmp/raiden-${ARCHIVE_TAG}-linux-<<parameters.architecture>> --help
+      - persist_to_workspace:
+          root: "~"
+          paths:
+            - raiden/dist/archive
+
+  build-binary-macos:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: macos
+      py-version: "3.7"
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: Prepare build
+          command: |
+            pip uninstall -y pdbpp
+            mkdir -p dist/archive
+            source .circleci/get_archive_tag.sh
+            echo $(uname -m)
+      - run:
+          name: Build macOS Binary
+          command: |
+            pyinstaller --noconfirm --clean raiden.spec
+            zip -9 --junk-paths dist/archive/raiden-${ARCHIVE_TAG}-macOS-x86_64.zip dist/raiden-${ARCHIVE_TAG}-macOS-x86_64
+            echo ${RELEASE_TYPE}/raiden-${ARCHIVE_TAG}-macOS-x86_64.zip > dist/archive/_LATEST-${RELEASE_TYPE}-macOS-x86_64.txt
+      - run:
+          name: Test if Binary can be launched
+          command: |
+            dist/raiden-${ARCHIVE_TAG}-macOS-x86_64 --help
+      - persist_to_workspace:
+          root: "~"
+          paths:
+            - raiden/dist/archive
+
+  deploy-homebrew:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: "3.7"
+
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "a1:33:d7:62:77:54:79:76:32:4a:d3:5e:89:70:ce:31"
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: Configure Git
+          command: |
+            git config --global user.email "contact@raiden.network"
+            git config --global user.name "Raiden Network"
+      - run:
+          name: Configure SSH
+          command: .circleci/fetch_ssh_hostkey.sh github.com "SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8"
+      - run:
+          name: Checkout homebrew-raiden
+          command: |
+            git clone git@github.com:raiden-network/homebrew-raiden
+      - run:
+          name: Update Formula
+          command: |
+            source .circleci/get_archive_tag.sh
+            python3 homebrew-raiden/render_template.py \
+              --version "${ARCHIVE_TAG}" \
+              --archive-file "dist/archive/raiden-${ARCHIVE_TAG}-macOS-x86_64.zip" \
+              --template-file "homebrew-raiden/raiden.rb.template" \
+              --target-file "homebrew-raiden/raiden.rb"
+      - run:
+          name: Commit and Push Updated Formula
+          command: |
+            source .circleci/get_archive_tag.sh
+            pushd homebrew-raiden
+            git add raiden.rb
+            git commit -m "Update formula to ${ARCHIVE_TAG}"
+            git tag -a "${ARCHIVE_TAG}" -m "${ARCHIVE_TAG}"
+            git push --follow-tags
+            popd
+
+  deploy-digitalocean:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: "3.7"
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: upload-to-digitalocean
+          command: |
+            .circleci/get_archive_tag.sh
+            .circleci/upload_to_s3.sh $DO_S3_ACCESS_KEY $DO_S3_SECRET_KEY dist/archive/ $DO_S3_BUCKET_NAME ams3.digitaloceanspaces.com
+
+  deploy-github-release:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    working_directory: ~/raiden
+    docker:
+      - image: cibuilds/github:0.10
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - when:
+          condition: ${CIRCLE_TAG} && ${GITHUB_TOKEN}
+          steps:
+            - run:
+                name: "Publish Release on GitHub"
+                command: |
+                  rm dist/archive/*.txt
+                  echo "TAG: ${CIRCLE_TAG}"
+                  ghr -t ${GITHUB_TOKEN_RELEASES} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1} -replace ${CIRCLE_TAG} dist/archive/
+
+  deploy-pypi:
+    parameters:
+      py-version:
+        <<: *py-version-template
+
+    executor:
+      name: docker
+      py-version: "3.7"
+
+    steps:
+      - attach-and-link:
+          py-version: << parameters.py-version >>
+      - conditional-skip
+      - config-path
+      - run:
+          name: "Install Twine"
+          command: pip install twine
+
+      - run:
+          name: "Create Packages"
+          command: |
+            echo $(python setup.py --version)
+            python setup.py sdist
+            python setup.py bdist_wheel
+      - run:
+          name: "Upload to PyPI"
+          command: |
+            twine upload -u __token__ -p $PYPI_API_TOKEN_RAIDEN dist/*.{tar.gz,whl}
+
+workflows:
+  raiden-default:
+    jobs:
+      - checkout
+
+      - prepare-system-linux:
+          requires:
+            - checkout
+
+      - prepare-python-linux:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+            - prepare-system-linux
+
+      - shellcheck/check:
+          name: shellcheck
+          requires:
+            - prepare-system-linux
+
+      - lint:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+            - prepare-python-linux-<< matrix.py-version >>
+
+      - build-docs:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+            - prepare-python-linux-<< matrix.py-version >>
+
+      - smoketest:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              transport-layer: ["matrix"]
+              environment-type: ["production", "development"]
+              blockchain-type: ["geth", "parity"]
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - test:
+          matrix:
+            alias: test
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              test-type: ["unit", "mocked"]
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - test:
+          matrix:
+            alias: test-fuzz
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              test-type: ["fuzz"]
+          additional-args: "--hypothesis-show-statistics"
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - benchmark:
+          context: "raiden-general-2021"
+          requires:
+            - lint
+          filters:
+            branches:
+              only:
+                - develop
+
+      - scenario-player-integration-test:
+          name: scenario-player-integration-test
+          py-version: "3.7"
+          requires:
+            - smoketest
+            - test
+            - test-fuzz
+            - shellcheck
+
+      - test:
+          matrix:
+            alias: test-integration
+            parameters:
+              py-version: ["3.7"]
+              test-type: ["integration"]
+              blockchain-type: ["geth", "parity"]
+          resource: "medium+"
+          transport-layer: "matrix"
+          parallelism: 25
+          requires:
+            - smoketest
+            - test
+            - test-fuzz
+            - shellcheck
+
+      - finalize:
+          requires:
+            - scenario-player-integration-test
+            - test-integration
+            - build-docs
+
+  deploy-release:
+    jobs:
+      - checkout:
+          filters:
+            <<: *only-tagged-version-filter
+
+      - prepare-system-linux:
+          requires:
+            - checkout
+          filters:
+            <<: *only-tagged-version-filter
+
+      - prepare-system-macos:
+          requires:
+            - checkout
+          filters:
+            <<: *only-tagged-version-filter
+
+      - prepare-python-linux:
+          py-version: '3.7'
+          requires:
+            - prepare-system-linux
+          filters:
+            <<: *only-tagged-version-filter
+
+      - prepare-python-macos:
+          py-version: '3.7'
+          requires:
+            - prepare-system-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+      - build-binary-linux:
+          name: build-binary-linux-x86
+          requires:
+            - prepare-python-linux
+          filters:
+            <<: *only-tagged-version-filter
+
+      - build-binary-macos:
+          requires:
+            - prepare-python-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+      - deploy-homebrew:
+          requires:
+            - build-binary-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+      - deploy-digitalocean:
+          context: "raiden-py"
+          requires:
+            - build-binary-linux-x86
+            - build-binary-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+      - deploy-github-release:
+          context: "raiden-general-2021"
+          requires:
+            - build-binary-linux-x86
+            - build-binary-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+      - deploy-pypi:
+          context: "raiden-py"
+          requires:
+            - build-binary-linux-x86
+            - build-binary-macos
+          filters:
+            <<: *only-tagged-version-filter
+
+  nightly:
+    jobs:
+      - checkout
+
+      - prepare-system-linux:
+          requires:
+            - checkout
+
+      - prepare-python-linux:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+          - prepare-system-linux
+
+      - shellcheck/check:
+          name: shellcheck
+          requires:
+            - prepare-system-linux
+
+      - lint:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+          - prepare-python-linux-<< matrix.py-version >>
+
+      - build-docs:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+          requires:
+            - prepare-python-linux-<< matrix.py-version >>
+
+      - smoketest:
+          matrix:
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              transport-layer: ["matrix"]
+              environment-type: ["production", "development"]
+              blockchain-type: ["geth", "parity"]
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - test:
+          matrix:
+            alias: test
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              test-type: ["unit", "mocked"]
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - test:
+          matrix:
+            alias: test-fuzz
+            parameters:
+              py-version: ["3.7", "3.8", "3.9"]
+              test-type: ["fuzz"]
+          additional-args: "--hypothesis-show-statistics"
+          requires:
+            - lint-<< matrix.py-version >>
+
+      - benchmark:
+          context: "raiden-general-2021"
+          requires:
+            - lint
+          filters:
+            branches:
+              only:
+                - develop
+
+      - scenario-player-integration-test:
+          name: scenario-player-integration-test
+          py-version: "3.7"
+          requires:
+            - smoketest
+            - test
+            - test-fuzz
+            - shellcheck
+
+      - test:
+          matrix:
+            alias: test-integration
+            parameters:
+              py-version: ["3.7"]
+              test-type: ["integration"]
+              blockchain-type: ["geth", "parity"]
+          resource: "medium+"
+          transport-layer: "matrix"
+          parallelism: 25
+          requires:
+            - smoketest
+            - test
+            - test-fuzz
+            - shellcheck
+
+      - finalize:
+          requires:
+          - scenario-player-integration-test
+          - test-integration
+          - build-docs
+
+      - build-binary-linux:
+          name: build-binary-linux-x86
+          requires:
+            - finalize
+
+      - prepare-system-macos:
+          requires:
+            - checkout
+
+      - prepare-python-macos:
+          name: prepare-python-macos-3.7
+          py-version: '3.7'
+          requires:
+            - prepare-system-macos
+
+      - build-binary-macos:
+          requires:
+            - finalize
+            - prepare-python-macos-3.7
+
+      - deploy-digitalocean:
+          context: "raiden-py"
+          requires:
+            - build-binary-linux-x86
+            - build-binary-macos
+
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - develop

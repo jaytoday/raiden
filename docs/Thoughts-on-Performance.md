@@ -45,19 +45,15 @@
 ### De/serializations:
 *     30k TXs per second
 
-### udp messages per second:
-*     http://nichol.as/asynchronous-servers-in-python
-*     2x20k measured = 40k # 1024 bytes
-
 ```
 Time per round:
 on receive
-    receive Msg:     15μs   #
-    deserialize Msg  30μs   # 30 deserializations
-    recover:        260μs   #
-    serialize Ack:   30μs   # acks are not signed
-    send Ack:        15μs
-                    350μs
+    receive Msg:               15μs   #
+    deserialize Msg            30μs   # 30 deserializations
+    recover:                   260μs   #
+    serialize Processed Msg:   30μs   # processed messages are not signed
+    send Processed Msg:        15μs
+                               350μs
 always:
     pathfinding:     20μs   # 50k paths / second
     businesslogic   250μs   # 2000 Locked Transfers / second (send + receive)
@@ -66,7 +62,7 @@ on respond
     signing Msg:    170μs
     serialize Msg:   30μs
     send Msg:        15μs
-    receive Ack:     15μs
+    receive Processed Msg:     15μs
                     320μs
 ----------------------------------------
                     940μs
@@ -91,7 +87,7 @@ Exchange: 8f+2h Messages = 7.5 + 1.24 ms = 9ms
     B: MediatedTransfer
     A: HashLock
     B: HashLock
-    C: Ack
+    C: Processed Msg
 
 
 3ms per transfer:
@@ -125,7 +121,7 @@ c4.8xlarge  60.0 GB     132 units   36 cores    0 GB (EBS only)
 * 1,080,000 transfers / hour
 * .05 hourly 1 ec2 instance
 * 1M transfer / 5ct
-* 100M transfers / 
+* 100M transfers /
 
 **Alternatively:**
 Run the 50K TPS of Visa for a cost of $180 / day (on 150 ec2 instances)

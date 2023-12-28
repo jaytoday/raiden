@@ -1,290 +1,262 @@
-# -*- coding: utf-8 -*-
-from raiden.transfer.architecture import State
 # pylint: disable=too-few-public-methods,too-many-arguments,too-many-instance-attributes
+from dataclasses import dataclass, field
+
+from raiden.constants import EMPTY_SECRETHASH, LOCKSROOT_OF_NO_LOCKS
+from raiden.transfer.architecture import State
+from raiden.transfer.state import (
+    BalanceProofSignedState,
+    BalanceProofUnsignedState,
+    HashTimeLockState,
+    HopState,
+    RouteState,
+    get_address_metadata,
+)
+from raiden.utils.secrethash import sha256_secrethash
+from raiden.utils.typing import (
+    TYPE_CHECKING,
+    Address,
+    AddressMetadata,
+    BlockTimeout,
+    ChannelID,
+    Dict,
+    InitiatorAddress,
+    List,
+    MessageID,
+    Optional,
+    PaymentAmount,
+    PaymentID,
+    Secret,
+    SecretHash,
+    T_Address,
+    TargetAddress,
+    TokenAddress,
+    TokenNetworkAddress,
+    TokenNetworkRegistryAddress,
+    typecheck,
+)
+
+if TYPE_CHECKING:
+    # pylint: disable=unused-import
+    from raiden.transfer.mediated_transfer.events import SendSecretReveal  # noqa
 
 
-def lockedtransfer_from_message(message):
-    """ Create LockedTransferState from a MediatedTransfer message. """
-    transfer_state = LockedTransferState(
-        identifier=message.identifier,
-        amount=message.lock.amount,
-        token=message.token,
-        initiator=message.initiator,
-        target=message.target,
-        expiration=message.lock.expiration,
-        hashlock=message.lock.hashlock,
-        secret=None,
-    )
-
-    return transfer_state
-
-
-class InitiatorState(State):
-    """ State of a node initiating a mediated transfer.
-
-    Args:
-        our_address (address): This node address.
-        transfer (LockedTransferState): The description of the mediated transfer.
-        routes (RoutesState): Routes available for this transfer.
-        block_number (int): Latest known block number.
-        random_generator (generator): A generator that yields valid secrets.
-    """
-    __slots__ = (
-        'our_address',
-        'transfer',
-        'routes',
-        'random_generator',
-        'block_number',
-        'message',
-        'route',
-        'secretrequest',
-        'revealsecret',
-        'canceled_transfers',
-    )
-
-    def __init__(self, our_address, transfer, routes, block_number, random_generator):
-        self.our_address = our_address
-        self.transfer = transfer
-        self.routes = routes
-        self.block_number = block_number
-        self.random_generator = random_generator
-
-        self.message = None  #: current message in-transit
-        self.route = None  #: current route being used
-        self.secretrequest = None
-        self.revealsecret = None
-        self.canceled_transfers = list()
-
-
-class MediatorState(State):
-    """ State of a node mediating a transfer.
-
-    Args:
-        our_address (address): This node address.
-        routes (RoutesState): Routes available for this transfer.
-        block_number (int): Latest known block number.
-        hashlock (bin): The hashlock used for this transfer.
-    """
-    __slots__ = (
-        'our_address',
-        'routes',
-        'block_number',
-        'hashlock',
-        'secret',
-        'transfers_pair',
-    )
-
-    def __init__(
-            self,
-            our_address,
-            routes,
-            block_number,
-            hashlock):
-
-        self.our_address = our_address
-        self.routes = routes
-        self.block_number = block_number
-
-        # for convenience
-        self.hashlock = hashlock
-        self.secret = None
-
-        # keeping all transfers in a single list byzantine behavior for secret
-        # reveal and simplifies secret setting
-        self.transfers_pair = list()
-
-
-class TargetState(State):
-    """ State of mediated transfer target.  """
-    __slots__ = (
-        'our_address',
-        'from_route',
-        'from_transfer',
-        'block_number',
-        'secret',
-        'state',
-    )
-
-    valid_states = (
-        'secret_request',
-        'reveal_secret',
-        'balance_proof',
-    )
-
-    def __init__(
-            self,
-            our_address,
-            from_route,
-            from_transfer,
-            block_number):
-
-        self.our_address = our_address
-        self.from_route = from_route
-        self.from_transfer = from_transfer
-        self.block_number = block_number
-
-        self.state = 'secret_request'
-
-
+@dataclass
 class LockedTransferState(State):
-    """ State of a transfer that is time hash locked.
 
-    Args:
-        identifier (int): A unique identifer for the transfer.
-        amount (int): Amount of `token' being transferred.
-        token (address): Token being transferred.
-        target (address): Transfer target address.
-        expiration (int): The absolute block number that the lock expires.
-        hashlock (bin): The hashlock.
-        secret (bin): The secret that unlocks the lock, may be None.
+    payment_identifier: PaymentID
+    token: TokenAddress
+    lock: HashTimeLockState
+    initiator: InitiatorAddress
+    target: TargetAddress
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lock, HashTimeLockState):
+            raise ValueError("lock must be a HashTimeLockState instance")
+
+
+@dataclass
+class LockedTransferUnsignedState(LockedTransferState):
+    """State for a transfer created by the local node which contains a hash
+    time lock and may be sent.
     """
-    __slots__ = (
-        'identifier',
-        'amount',
-        'token',
-        'initiator',
-        'target',
-        'expiration',
-        'hashlock',
-        'secret',
-    )
 
-    def __init__(
-            self,
-            identifier,
-            amount,
-            token,
-            initiator,
-            target,
-            expiration,
-            hashlock,
-            secret):
+    balance_proof: BalanceProofUnsignedState
+    route_states: List[RouteState] = field(default_factory=list)
 
-        self.identifier = identifier
-        self.amount = amount
-        self.token = token
-        self.initiator = initiator
-        self.target = target
-        self.expiration = expiration
-        self.hashlock = hashlock
-        self.secret = secret
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
-    def __str__(self):
-        return '<HashTimeLocked id={} amount={} token={} target={} expire={} hashlock={}>'.format(
-            self.identifier,
-            self.amount,
-            self.token,
-            self.target,
-            self.expiration,
-            self.hashlock,
-        )
+        typecheck(self.lock, HashTimeLockState)
+        typecheck(self.balance_proof, BalanceProofUnsignedState)
 
-    def almost_equal(self, other):
-        """ True if both transfers are for the same mediated transfer. """
-        if isinstance(other, LockedTransferState):
-            # the only value that may change for each hop is the expiration
-            return (
-                self.identifier == other.identifier and
-                self.amount == other.amount and
-                self.token == other.token and
-                self.target == other.target and
-                self.hashlock == other.hashlock and
-                self.secret == other.secret
-            )
+        # At least the lock for this transfer must be in the locksroot, so it
+        # must not be empty
+        if self.balance_proof.locksroot == LOCKSROOT_OF_NO_LOCKS:
+            raise ValueError("balance_proof must not be empty")
 
-    def __eq__(self, other):
-        if isinstance(other, LockedTransferState):
-            return (
-                self.almost_equal(other) and
-                self.expiration == other.expiration
-            )
-
-        return False
+    @property
+    def initiator_address_metadata(self) -> Optional[AddressMetadata]:
+        return get_address_metadata(Address(self.initiator), self.route_states)
 
 
+@dataclass
+class LockedTransferSignedState(LockedTransferState):
+    """State for a received transfer which contains a hash time lock and a
+    signed balance proof.
+    """
+
+    message_identifier: MessageID
+    route_states: List[RouteState]
+    balance_proof: BalanceProofSignedState = field(repr=False)
+
+    def __post_init__(self) -> None:
+        typecheck(self.lock, HashTimeLockState)
+        typecheck(self.balance_proof, BalanceProofSignedState)
+
+        # At least the lock for this transfer must be in the locksroot, so it
+        # must not be empty
+        # pylint: disable=E1101
+        if self.balance_proof.locksroot == LOCKSROOT_OF_NO_LOCKS:
+            raise ValueError("balance_proof must not be empty")
+
+    @property
+    def initiator_address_metadata(self) -> Optional[AddressMetadata]:
+        return get_address_metadata(Address(self.initiator), self.route_states)
+
+    @property
+    def routes(self) -> List[List[Address]]:
+        # TODO legacy property, remove later on if desired
+        return [rs.route for rs in self.route_states]
+
+    @property
+    def payer_address(self) -> Address:
+        # pylint: disable=E1101
+        return self.balance_proof.sender
+
+    @property
+    def payer_address_metadata(self) -> Optional[AddressMetadata]:
+        return get_address_metadata(self.payer_address, self.route_states)
+
+
+@dataclass
+class TransferDescriptionWithSecretState(State):
+    """Describes a transfer (target, amount, and token) and contains an
+    additional secret that can be used with a hash-time-lock.
+    """
+
+    token_network_registry_address: TokenNetworkRegistryAddress = field(repr=False)
+    payment_identifier: PaymentID = field(repr=False)
+    amount: PaymentAmount
+    token_network_address: TokenNetworkAddress
+    initiator: InitiatorAddress = field(repr=False)
+    target: TargetAddress
+    secret: Secret = field(repr=False)
+    secrethash: SecretHash = field(default=EMPTY_SECRETHASH)
+    lock_timeout: Optional[BlockTimeout] = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.secrethash == EMPTY_SECRETHASH and self.secret:
+            self.secrethash = sha256_secrethash(self.secret)
+
+
+@dataclass
+class WaitingTransferState(State):
+    transfer: LockedTransferSignedState
+    state: str = field(default="waiting")
+
+
+@dataclass
+class InitiatorTransferState(State):
+    """State of a transfer for the initiator node."""
+
+    route: RouteState
+    transfer_description: TransferDescriptionWithSecretState = field(repr=False)
+    channel_identifier: ChannelID
+    transfer: LockedTransferUnsignedState
+    received_secret_request: bool = field(default=False, repr=False)
+    transfer_state: str = field(default="transfer_pending")
+
+
+@dataclass
+class InitiatorPaymentState(State):
+    """State of a payment for the initiator node.
+    A single payment may have multiple transfers. E.g. because if one of the
+    transfers fails or timeouts another transfer will be started with a
+    different secrethash.
+    """
+
+    routes: List[RouteState]
+    initiator_transfers: Dict[SecretHash, InitiatorTransferState]
+    cancelled_channels: List[ChannelID] = field(repr=False, default_factory=list)
+
+
+@dataclass
 class MediationPairState(State):
-    """ State for a mediated transfer.
-
+    """State for a mediated transfer.
     A mediator will pay payee node knowing that there is a payer node to cover
-    the token expenses. This state keeps track of the routes and transfer for
+    the token expenses. This state keeps track of transfers for
     the payer and payee, and the current state of the payment.
     """
-    __slots__ = (
-        'payee_route',
-        'payee_transfer',
-        'payee_state',
 
-        'payer_route',
-        'payer_transfer',
-        'payer_state',
-    )
-
+    payer_transfer: LockedTransferSignedState
+    payee_address: Address
+    payee_transfer: LockedTransferUnsignedState
+    payer_state: str = field(default="payer_pending")
+    payee_state: str = field(default="payee_pending")
     # payee_pending:
     #   Initial state.
     #
     # payee_secret_revealed:
     #   The payee is following the raiden protocol and has sent a SecretReveal.
     #
-    # payee_refund_withdraw:
-    #   The corresponding refund transfer was withdrawn on-chain, the payee has
-    #   /not/ withdrawn the lock yet, it only learned the secret through the
-    #   blockchain.
-    #   Note: This state is reachable only if there is a refund transfer, that
-    #   is represented by a different MediationPairState, and the refund
-    #   transfer is at 'payer_contract_withdraw'.
-    #
-    # payee_contract_withdraw:
+    # payee_contract_unlock:
     #   The payee received the token on-chain. A transition to this state is
     #   valid from all but the `payee_expired` state.
     #
     # payee_balance_proof:
-    #   This node has sent a SendBalanceProof to the payee with the balance
+    #   This node has sent a SendUnlock to the payee with the balance
     #   updated.
     #
     # payee_expired:
     #   The lock has expired.
     valid_payee_states = (
-        'payee_pending',
-        'payee_secret_revealed',
-        'payee_refund_withdraw',
-        'payee_contract_withdraw',
-        'payee_balance_proof',
-        'payee_expired',
+        "payee_pending",
+        "payee_secret_revealed",
+        "payee_contract_unlock",
+        "payee_balance_proof",
+        "payee_expired",
     )
 
     valid_payer_states = (
-        'payer_pending',
-        'payer_secret_revealed',    # SendRevealSecret was sent
-        'payer_waiting_close',      # ContractSendChannelClose was sent
-        'payer_waiting_withdraw',   # ContractSendWithdraw was sent
-        'payer_contract_withdraw',  # ContractReceiveWithdraw for the above send received
-        'payer_balance_proof',      # ReceiveBalanceProof was received
-        'payer_expired',            # None of the above happened and the lock expired
+        "payer_pending",
+        "payer_secret_revealed",  # SendSecretReveal was sent
+        "payer_waiting_unlock",  # ContractSendChannelBatchUnlock was sent
+        "payer_waiting_secret_reveal",  # ContractSendSecretReveal was sent
+        "payer_balance_proof",  # ReceiveUnlock was received
+        "payer_expired",  # None of the above happened and the lock expired
     )
 
-    def __init__(
-            self,
-            payer_route,
-            payer_transfer,
-            payee_route,
-            payee_transfer):
-        """
-        Args:
-            payer_route (RouteState): The details of the route with the payer.
-            payer_transfer (LockedTransferState): The transfer this node
-                *received* that will cover the expenses.
+    def __post_init__(self) -> None:
+        typecheck(self.payer_transfer, LockedTransferSignedState)
+        typecheck(self.payee_address, T_Address)
+        typecheck(self.payee_transfer, LockedTransferUnsignedState)
 
-            payee_route (RouteState): The details of the route with the payee.
-            payee_transfer (LockedTransferState): The transfer this node *sent*
-                that will be withdrawn by the payee.
-        """
-        self.payer_route = payer_route
-        self.payer_transfer = payer_transfer
+    @property
+    def payer_address(self) -> Address:
+        return self.payer_transfer.payer_address
 
-        self.payee_route = payee_route
-        self.payee_transfer = payee_transfer
 
-        # these transfers are settled on different payment channels. These are
-        # the states of each mediated transfer in respect to each channel.
-        self.payer_state = 'payer_pending'
-        self.payee_state = 'payee_pending'
+@dataclass
+class MediatorTransferState(State):
+    """State of a transfer for the mediator node.
+    A mediator may manage multiple channels because of refunds, but all these
+    channels will be used for the same transfer (not for different payments).
+    Args:
+        secrethash: The secrethash used for this transfer.
+        routes: list of all routes given for this transfer
+        refunded_channels: list of channel identifiers that sent refunds
+    """
+
+    secrethash: SecretHash
+    routes: List[RouteState]
+    refunded_channels: List[ChannelID] = field(repr=False, default_factory=list)
+    secret: Optional[Secret] = field(default=None)
+    transfers_pair: List[MediationPairState] = field(default_factory=list)
+    waiting_transfer: Optional[WaitingTransferState] = field(default=None)
+
+
+@dataclass
+class TargetTransferState(State):
+    """State of a transfer for the target node."""
+
+    EXPIRED = "expired"
+    OFFCHAIN_SECRET_REVEAL = "reveal_secret"
+    ONCHAIN_SECRET_REVEAL = "onchain_secret_reveal"
+    ONCHAIN_UNLOCK = "onchain_unlock"
+    SECRET_REQUEST = "secret_request"
+
+    from_hop: HopState = field(repr=False)
+    transfer: LockedTransferSignedState
+    secret: Optional[Secret] = field(repr=False, default=None)
+    state: str = field(default="secret_request")
+    initiator_address_metadata: Optional[AddressMetadata] = None

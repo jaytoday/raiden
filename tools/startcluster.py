@@ -1,235 +1,94 @@
 #!/usr/bin/env python
-import os
-import shlex
-import json
-import time
+import random
 import tempfile
-import signal
-from subprocess import Popen, PIPE
+from signal import SIGINT, SIGTERM, Signals, signal
+from types import FrameType
+from typing import ContextManager
 
-from raiden.utils import privatekey_to_address
-from ethereum.utils import sha3, encode_hex
-from devp2p.crypto import privtopub as privtopub_enode
+from eth_typing import URI, HexStr
+from eth_utils import keccak, remove_0x_prefix
+from web3 import HTTPProvider, Web3
 
-from genesis_builder import mk_genesis, generate_accounts
+from raiden.tests.fixtures.constants import DEFAULT_BALANCE
+from raiden.tests.utils.eth_node import (
+    AccountDescription,
+    EthNodeDescription,
+    GenesisDescription,
+    run_private_blockchain,
+)
+from raiden.utils.http import JSONRPCExecutor
+from raiden.utils.keys import privatekey_to_address
+from raiden.utils.typing import ChainID, List, Port, PrivateKey, TokenAmount
+from raiden_contracts.constants import CHAINNAME_TO_ID
 
-# DEFAULTS
 NUM_GETH_NODES = 3
 NUM_RAIDEN_ACCOUNTS = 10
-CLUSTER_NAME = 'raiden'
-RAIDEN_PORT = 40001
-DEFAULT_PW = 'notsosecret'
+START_PORT = 30301
+START_RPCPORT = 8101
 
 
-# default args to pass to `geth` for all calls, e.g. verbosity, ...
-DEFAULT_ARGS = [
-    '--nodiscover',
-    '--rpc',
-    '--networkid {}'.format(sum(ord(c) for c in CLUSTER_NAME)),
+DEFAULT_ACCOUNTS_SEEDS = [
+    "127.0.0.1:{}".format(START_PORT + i).encode() for i in range(NUM_RAIDEN_ACCOUNTS)
 ]
-
-# the node specific arguments to pass to `geth` that will be extracted from a
-# 'node configuration'
-NODE_CONFIG = [
-    'nodekeyhex',
-    'port',
-    'rpcport',
-    'bootnodes',
-    'minerthreads',
-    'unlock'
+DEFAULT_ACCOUNTS_KEYS: List[PrivateKey] = [
+    PrivateKey(keccak(seed)) for seed in DEFAULT_ACCOUNTS_SEEDS
 ]
-
-# a list of `num_raiden_accounts` account addresses with a predictable privkey:
-# privkey = sha3('127.0.0.1:`raiden_port + i`')
-DEFAULTACCOUNTS = [
-    value['address']
-    for value in generate_accounts([
-        '127.0.0.1:{}'.format(RAIDEN_PORT + i)
-        for i in range(NUM_RAIDEN_ACCOUNTS)
-    ]).values()
+DEFAULT_ACCOUNTS = [
+    AccountDescription(privatekey_to_address(key), TokenAmount(DEFAULT_BALANCE))
+    for key in DEFAULT_ACCOUNTS_KEYS
 ]
 
 
-def prepare_for_exec(nodes, parentdir, accounts=DEFAULTACCOUNTS):
-    """
-    Prepare the configurations from `nodes` for execution, i.e.
-    - prepare dataddirs
-    - create genesis-files
-    - create accounts (if necessary)
-    - transform node configuration to `geth ...` cmd args
+def main() -> None:
+    tmpdir = tempfile.mkdtemp()
 
-    :param nodes: list of node configurations
-    :param parentdir: the datadir parent for all nodes
-    :return: list of cmds for `Popen`
-    """
-    cmds = []
-    for node in nodes:
-        nodedir = os.path.join(parentdir, node['nodekeyhex'])
-        os.makedirs(nodedir)
-        init_datadir(nodedir, accounts=accounts)
-        if 'minerthreads' in node:
-            create_keystore_account(nodedir)
-        cmds.append(to_cmd(node, datadir=nodedir))
-    return cmds
+    geth_nodes = []
+    for i in range(NUM_GETH_NODES):
+        is_miner = i == 0
+        node_key = PrivateKey(keccak(f"node:{i}".encode()))
+        p2p_port = Port(START_PORT + i)
+        rpc_port = Port(START_RPCPORT + i)
 
-
-def to_cmd(node, datadir=None):
-    """
-    Transform a node configuration into a cmd-args list for `subprocess.Popen`.
-
-    :param node: a node configuration
-    :param datadir: the node's datadir
-    :return: cmd-args list
-    """
-    cmd = ['geth']
-    cmd.extend(
-        ['--{} {}'.format(k, v) for k, v in node.items() if k in NODE_CONFIG])
-    cmd.extend(DEFAULT_ARGS)
-    if 'minerthreads' in node:
-        cmd.append('--mine')
-        cmd.append('--etherbase 0')
-    if datadir:
-        assert isinstance(datadir, basestring)
-        cmd.append('--datadir {}'.format(datadir))
-    return shlex.split(' '.join(cmd))
-
-
-def create_keystore_account(datadir, privkey=encode_hex(sha3('localhost:627'))):
-    """
-    Create an account in `datadir` -- since we're not interested
-    in the rewards, we don't care about the created address.
-
-    :param datadir: the datadir in which the account is created
-    :return: None
-    """
-    with open(os.path.join(datadir, 'keyfile'), 'w') as f:
-        f.write(privkey)
-
-    create = Popen(
-        shlex.split('geth --datadir {} account import {}'.format(
-            datadir, os.path.join(datadir, 'keyfile'))),
-        stdin=PIPE, universal_newlines=True
-    )
-    create.stdin.write(DEFAULT_PW + os.linesep)
-    time.sleep(.1)
-    create.stdin.write(DEFAULT_PW + os.linesep)
-    create.communicate()
-    assert create.returncode == 0
-
-
-def init_datadir(datadir, accounts=DEFAULTACCOUNTS):
-    genesis_path = os.path.join(datadir, 'custom_genesis.json')
-
-    with open(genesis_path, 'w') as f:
-        json.dump(mk_genesis(accounts), f)
-
-    Popen(shlex.split(
-        'geth --datadir {} init {}'.format(datadir, genesis_path)
-    ))
-
-
-def create_node_configurations(num_nodes,
-                               miner=True,
-                               start_port=30301,
-                               start_rpcport=8101,
-                               host='127.0.0.1',
-                               ):
-    """
-    Create multiple configurations (ports, keys, etc...) for `num_nodes` on `host`.
-
-    :param num_nodes: the number of nodes to create
-    :param miner: if True, setup the first node to be a mining node
-    :param start_port: the first p2p port to assign
-    :param start_rpcport: the first rpc port to assign
-    :return: list of node configurations (dicts)
-    """
-    nodes = []
-    for i in range(num_nodes):
-        node = create_node_configuration(
-            miner=miner and i == 0,
-            port=start_port + i,
-            rpcport=start_rpcport + i,
-            node_key_seed=i
+        description = EthNodeDescription(
+            private_key=node_key,
+            rpc_port=rpc_port,
+            p2p_port=p2p_port,
+            miner=is_miner,
+            extra_config={},
         )
-        nodes.append(node)
-    return nodes
+
+        geth_nodes.append(description)
+
+    rpc_endpoint = URI(f"http://127.0.0.1:{START_RPCPORT}")
+    web3 = Web3(HTTPProvider(rpc_endpoint))
+
+    random_marker = remove_0x_prefix(HexStr(hex(random.getrandbits(100))))
+    genesis_description = GenesisDescription(
+        prefunded_accounts=DEFAULT_ACCOUNTS,
+        random_marker=random_marker,
+        chain_id=ChainID(CHAINNAME_TO_ID["smoketest"]),
+    )
+    private_chain: ContextManager[List[JSONRPCExecutor]] = run_private_blockchain(
+        web3=web3,
+        eth_nodes=geth_nodes,
+        base_datadir=tmpdir,
+        log_dir=tmpdir,
+        verbosity="info",
+        genesis_description=genesis_description,
+    )
+
+    with private_chain:
+        from IPython import embed
+
+        embed()
 
 
-def create_node_configuration(miner=True,
-                              port=30301,
-                              rpcport=8101,
-                              host='127.0.0.1',
-                              node_key_seed=0):
-    """
-    Create configuration (ports, keys, etc...) for one node.
-
-    :param miner: if True, setup to be a mining node
-    :param port: the p2p port to assign
-    :param rpcport: the port to assign
-    :param host: the host for the node to run on
-    :return: node configuration dict
-    """
-    node = dict()
-    if miner:
-        node['minerthreads'] = 1  # conservative
-        node['unlock'] = 0
-    node['nodekey'] = sha3('node:{}'.format(node_key_seed))
-    node['nodekeyhex'] = encode_hex(node['nodekey'])
-    node['pub'] = encode_hex(privtopub_enode(node['nodekey']))
-    node['address'] = privatekey_to_address(node['nodekey'])
-    node['host'] = host
-    node['port'] = port
-    node['rpcport'] = rpcport
-    node['enode'] = 'enode://{pub}@{host}:{port}'.format(**node)
-    return node
-
-
-def update_bootnodes(nodes):
-    """Join the bootnodes for number of node configurations.
-    """
-    for node in nodes:
-        node['bootnodes'] = ','.join(node['enode'] for node in nodes)
-
-
-def boot(cmds):
-    """
-    Run all `cmds` with a shutdown handler attached.
-    """
-    processes = []
-    try:
-        for cmd in cmds:
-            if '--unlock' in cmd:
-                proc = Popen(
-                    cmd,
-                    universal_newlines=True,
-                    stdin=PIPE,
-                )
-                # write password to unlock
-                proc.stdin.write(DEFAULT_PW + os.linesep)
-                processes.append(proc)
-            else:
-                processes.append(Popen(cmd))
-                print('spawned process')
-    except SystemExit:
-        for process in processes:
-            process.terminate()
-        print('clean shutdown')
-    finally:
-        print('Goodbye')
-
-
-def shutdown_handler(_signo, _stackframe):
+def shutdown_handler(_signo: Signals, _stackframe: FrameType) -> None:
     raise SystemExit
 
 
-if __name__ == '__main__':
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
+if __name__ == "__main__":
+    signal(SIGTERM, shutdown_handler)
+    signal(SIGINT, shutdown_handler)
 
-    datadir = tempfile.mkdtemp()
-    nodes = create_node_configurations(NUM_GETH_NODES)
-    update_bootnodes(nodes)
-    cmds = prepare_for_exec(nodes, datadir)
-    boot(cmds)
-    while True:
-        time.sleep(1)
+    main()

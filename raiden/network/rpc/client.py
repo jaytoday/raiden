@@ -1,1112 +1,1642 @@
-# -*- coding: utf-8 -*-
-from time import time as now
+import json
+from abc import ABC
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from uuid import uuid4
 
-import rlp
 import gevent
+import structlog
+from eth_typing import ChecksumAddress
+from eth_utils import (
+    decode_hex,
+    encode_hex,
+    is_bytes,
+    is_checksum_address,
+    to_canonical_address,
+    to_hex,
+)
+from eth_utils.toolz import assoc
 from gevent.lock import Semaphore
-from ethereum import slogging
-from ethereum import _solidity
-from ethereum.exceptions import InvalidTransaction
-from ethereum.transactions import Transaction
-from ethereum.utils import encode_hex, normalize_address
-from pyethapp.jsonrpc import (
-    address_encoder,
-    address_decoder,
-    data_decoder,
-    data_encoder,
-    default_gasprice,
+from hexbytes import HexBytes
+from requests.exceptions import ReadTimeout
+from web3 import HTTPProvider, Web3
+from web3._utils.contracts import (
+    encode_transaction_data,
+    find_matching_fn_abi,
+    prepare_transaction,
 )
-from pyethapp.rpc_client import topic_encoder, JSONRPCClient, block_tag_encoder
-import requests
-
-from raiden import messages
-from raiden.constants import NETTINGCHANNEL_SETTLE_TIMEOUT_MIN
-from raiden.settings import (
-    DEFAULT_POLL_TIMEOUT,
-    GAS_LIMIT,
-    GAS_PRICE,
-)
-from raiden.utils import (
-    get_contract_path,
-    isaddress,
-    pex,
-    privatekey_to_address,
-)
-from raiden.blockchain.abi import (
-    TOKENADDED_EVENTID,
-    CHANNEL_MANAGER_ABI,
-    CHANNELNEW_EVENTID,
-    ENDPOINT_REGISTRY_ABI,
-    HUMAN_TOKEN_ABI,
-    NETTING_CHANNEL_ABI,
-    REGISTRY_ABI,
+from web3._utils.empty import empty
+from web3.contract import Contract, ContractFunction
+from web3.eth import Eth
+from web3.exceptions import BlockNotFound, TransactionNotFound
+from web3.gas_strategies.rpc import rpc_gas_price_strategy
+from web3.middleware import simple_cache_middleware
+from web3.types import (
+    ABIFunction,
+    BlockData,
+    FilterParams,
+    LogReceipt,
+    RPCEndpoint,
+    RPCResponse,
+    TxParams,
+    TxReceipt,
+    Wei,
 )
 
-log = slogging.getLogger(__name__)  # pylint: disable=invalid-name
-solidity = _solidity.get_solidity()  # pylint: disable=invalid-name
+from raiden.constants import (
+    BLOCK_ID_LATEST,
+    BLOCK_ID_PENDING,
+    GENESIS_BLOCK_NUMBER,
+    NO_STATE_QUERY_AFTER_BLOCKS,
+    NULL_ADDRESS_CHECKSUM,
+    RECEIPT_FAILURE_CODE,
+    TRANSACTION_INTRINSIC_GAS,
+    WEB3_BLOCK_NOT_FOUND_RETRY_COUNT,
+    EthClient,
+)
+from raiden.exceptions import (
+    AddressWithoutCode,
+    ContractCodeMismatch,
+    EthereumNonceTooLow,
+    EthNodeInterfaceError,
+    InsufficientEth,
+    RaidenError,
+    RaidenUnrecoverableError,
+    ReplacementTransactionUnderpriced,
+)
+from raiden.network.rpc.middleware import block_hash_cache_middleware
+from raiden.utils.ethereum_clients import VersionSupport, is_supported_client
+from raiden.utils.formatting import to_checksum_address
+from raiden.utils.keys import privatekey_to_address
+from raiden.utils.smart_contracts import safe_gas_limit
+from raiden.utils.typing import (
+    ABI,
+    MYPY_ANNOTATION,
+    Address,
+    AddressHex,
+    BlockHash,
+    BlockIdentifier,
+    BlockNumber,
+    CompiledContract,
+    Nonce,
+    PrivateKey,
+    T_Address,
+    T_Nonce,
+    T_TransactionHash,
+    TokenAmount,
+    TransactionHash,
+    typecheck,
+)
+from raiden_contracts.utils.type_aliases import ChainID, T_ChainID
 
-# Coding standard for this module:
-#
-# - Be sure to reflect changes to this module in the test
-#   implementations. [tests/utils/*_client.py]
-# - Expose a synchronous interface by default
-#   - poll for the transaction hash
-#   - check if the proper events were emited
-#   - use `call` and `transact` to interact with pyethapp.rpc_client proxies
+log = structlog.get_logger(__name__)
+
+GETH_REQUIRE_OPCODE = "Missing opcode 0xfe"
+PARITY_REQUIRE_ERROR = "Bad instruction"
+EXTRA_DATA_LENGTH = 66  # 32 bytes hex encoded + `0x` prefix
 
 
-class JSONRPCPollTimeoutException(Exception):
-    # FIXME import this from pyethapp.rpc_client once it is implemented
-    pass
+def logs_blocks_sanity_check(from_block: BlockIdentifier, to_block: BlockIdentifier) -> None:
+    """Checks that the from/to blocks passed onto log calls contain only appropriate types"""
+    is_valid_from = isinstance(from_block, int) or isinstance(from_block, str)
+    assert is_valid_from, "event log from block can be integer or latest,pending, earliest"
+    is_valid_to = isinstance(to_block, int) or isinstance(to_block, str)
+    assert is_valid_to, "event log to block can be integer or latest,pending, earliest"
 
 
-def check_transaction_threw(client, transaction_hash):
-    """Check if the transaction threw or if it executed properly"""
-    encoded_transaction = data_encoder(transaction_hash.decode('hex'))
-    transaction = client.call('eth_getTransactionByHash', encoded_transaction)
-    receipt = client.call('eth_getTransactionReceipt', encoded_transaction)
-    return int(transaction['gas'], 0) == int(receipt['gasUsed'], 0)
+def check_transaction_failure(transaction: "TransactionMined", client: "JSONRPCClient") -> None:
+    """Raise an exception if the transaction consumed all the gas."""
+
+    if was_transaction_successfully_mined(transaction):
+        return
+
+    receipt = transaction.receipt
+    gas_used = receipt["gasUsed"]
+
+    # Transactions were `gas_used` is lower than `startgas` did hit an assert.
+    # These errors have to be further checked by the caller.
+    if gas_used >= transaction.startgas:
+
+        failed_with_require = client.transaction_failed_with_a_require(
+            transaction.transaction_hash
+        )
+        if failed_with_require is True:
+            if isinstance(transaction.data, SmartContractCall):
+                smart_contract_function = transaction.data.function
+                msg = (
+                    f"`{smart_contract_function}` failed because of a require. "
+                    f"This looks like a bug in the smart contract."
+                )
+            elif isinstance(transaction.data, ByteCode):
+                contract_name = transaction.data.contract_name
+                msg = (
+                    f"Deploying {contract_name} failed with a require, this "
+                    f"looks like a error detection or compiler bug!"
+                )
+            else:
+                typecheck(transaction.data, EthTransfer)
+                msg = (
+                    "EthTransfer failed with a require. This looks like a bug "
+                    "in the detection code or in the client reporting!"
+                )
+        elif failed_with_require is False:
+            if isinstance(transaction.data, SmartContractCall):
+                smart_contract_function = transaction.data.function
+                msg = (
+                    f"`{smart_contract_function}` failed and all gas was used "
+                    f"({gas_used}), but the last opcode was *not* a failed "
+                    f"`require`. This can happen for a few reasons: 1. The smart "
+                    f"contract code may have an assert inside an if statement, at "
+                    f"the time of gas estimation the condition was false, but "
+                    f"another transaction changed the state of the smart contrat "
+                    f"making the condition true. 2. The call to "
+                    f"`{smart_contract_function}` executes an opcode with "
+                    f"variable gas, at the time of gas estimation the cost was "
+                    f"low, but another transaction changed the environment so "
+                    f"that the new cost is high.  This is particularly "
+                    f"problematic storage is set to `0`, since the cost of a "
+                    f"`SSTORE` increases 4 times. 3. The cost of the function "
+                    f"varies with external state, if the cost increases because "
+                    f"of another transaction the transaction can fail."
+                )
+            elif isinstance(transaction.data, ByteCode):
+                contract_name = transaction.data.contract_name
+                msg = (
+                    f"Deploying {contract_name} failed because all gas was used, "
+                    f"this looks like a gas estimation bug!"
+                )
+            else:
+                typecheck(transaction.data, EthTransfer)
+                msg = "EthTransfer failed!"
+
+        else:
+            # Couldn't determine if a require was hit because the debug
+            # interfaces were not enabled.
+            if isinstance(transaction.data, SmartContractCall):
+                smart_contract_function = transaction.data.function
+
+                # This error happened multiple times, it deserves a refresher on
+                # frequent reasons why it may happen:
+                msg = (
+                    f"`{smart_contract_function}` failed and all gas was used "
+                    f"({gas_used}). This can happen for a few reasons: "
+                    f"1. The smart contract code may have an assert inside an if "
+                    f"statement, at the time of gas estimation the condition was false, "
+                    f"but another transaction changed the state of the smart contrat "
+                    f"making the condition true. 2. The call to "
+                    f"`{smart_contract_function}` executes an opcode with variable gas, "
+                    f"at the time of gas estimation the cost was low, but another "
+                    f"transaction changed the environment so that the new cost is high. "
+                    f"This is particularly problematic storage is set to `0`, since the "
+                    f"cost of a `SSTORE` increases 4 times. 3. The cost of the function "
+                    f"varies with external state, if the cost increases because of "
+                    f"another transaction the transaction can fail. 4. There is a bug in the"
+                    f"smart contract and a `require` condition failed."
+                )
+            elif isinstance(transaction.data, ByteCode):
+                contract_name = transaction.data.contract_name
+                msg = f"Deploying {contract_name} failed because all the gas was used!"
+            else:
+                typecheck(transaction.data, EthTransfer)
+                msg = "EthTransfer failed!"
+
+        # Keeping this around just in case the wrong value from the receipt is
+        # used (Previously the `cumulativeGasUsed` was used, which was
+        # incorrect).
+        if gas_used > transaction.startgas:
+            msg = (
+                "The receipt `gasUsed` reported in the receipt is higher than the "
+                "transaction startgas!." + msg
+            )
+
+        # This cannot be a unrecoverable in general, since transactions to
+        # external smart contracts may fail.
+        raise RaidenError(msg)
 
 
-def patch_send_transaction(client, nonce_offset=0):
-    """Check if the remote supports pyethapp's extended jsonrpc spec for local tx signing.
-    If not, replace the `send_transaction` method with a more generic one.
-    """
-    patch_necessary = False
+def was_transaction_successfully_mined(transaction: "TransactionMined") -> bool:
+    """`True` if the transaction was successfully mined, `False` otherwise."""
+    if "status" not in transaction.receipt:
+        # This should never happen. Raiden checks ethereum client for compatibility at startup
+        raise AssertionError(
+            "Transaction receipt does not contain a status field. Upgrade your client"
+        )
+
+    return transaction.receipt["status"] != RECEIPT_FAILURE_CODE
+
+
+def geth_assert_rpc_interfaces(web3: Web3) -> None:
+    try:
+        web3.clientVersion
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying geth node does not have the web3 rpc interface "
+            "enabled. Please run it with '--http.api eth,net,web3'"
+        )
 
     try:
-        client.call('eth_nonce', encode_hex(client.sender), 'pending')
-    except:
-        patch_necessary = True
-        client.last_nonce_update = 0
-        client.current_nonce = None
-        client.nonce_lock = Semaphore()
-
-    def send_transaction(sender, to, value=0, data='', startgas=GAS_LIMIT,
-                         gasprice=GAS_PRICE, nonce=None):
-        """Custom implementation for `pyethapp.rpc_client.JSONRPCClient.send_transaction`.
-        This is necessary to support other remotes that don't support pyethapp's extended specs.
-        @see https://github.com/ethereum/pyethapp/blob/develop/pyethapp/rpc_client.py#L359
-        """
-        def get_nonce():
-            """Eventually syncing nonce counter.
-            This will keep a local nonce counter that is only syncing against
-            the remote every `UPDATE_INTERVAL`.
-
-            If the remote counter is lower than the current local counter,
-            it will wait for the remote to catch up.
-            """
-            with client.nonce_lock:
-                UPDATE_INTERVAL = 5.
-                query_time = now()
-                needs_update = abs(query_time - client.last_nonce_update) > UPDATE_INTERVAL
-                not_initialized = client.current_nonce is None
-                if needs_update or not_initialized:
-                    nonce = _query_nonce()
-                    # we may have hammered the server and not all tx are
-                    # registered as `pending` yet
-                    while nonce < client.current_nonce:
-                        log.debug(
-                            "nonce on server too low; retrying",
-                            server=nonce,
-                            local=client.current_nonce
-                        )
-                        nonce = _query_nonce()
-                        query_time = now()
-                    client.current_nonce = nonce
-                    client.last_nonce_update = query_time
-                else:
-                    client.current_nonce += 1
-                return client.current_nonce
-
-        def _query_nonce():
-            pending_transactions_hex = client.call(
-                'eth_getTransactionCount',
-                address_encoder(sender),
-                'pending',
-            )
-            pending_transactions = int(pending_transactions_hex, 16)
-            nonce = pending_transactions + nonce_offset
-            return nonce
-
-        nonce = get_nonce()
-
-        tx = Transaction(nonce, gasprice, startgas, to, value, data)
-        assert hasattr(client, 'privkey') and client.privkey
-        tx.sign(client.privkey)
-        result = client.call(
-            'eth_sendRawTransaction',
-            data_encoder(rlp.encode(tx)),
+        web3.eth.block_number
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying geth node does not have the eth rpc interface "
+            "enabled. Please run it with '--http.api eth,net,web3'"
         )
-        return result[2 if result.startswith('0x') else 0:]
 
-    if patch_necessary:
-        client.send_transaction = send_transaction
+    try:
+        web3.net.version
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying geth node does not have the net rpc interface "
+            "enabled. Please run it with '--http.api eth,net,web3'"
+        )
 
 
-def patch_send_message(client, pool_maxsize=50):
-    """Monkey patch fix for issue #253. This makes the underlying `tinyrpc`
-    transport class use a `requests.session` instead of regenerating sessions
-    for each request.
+def parity_assert_rpc_interfaces(web3: Web3) -> None:
+    try:
+        web3.clientVersion
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying parity node does not have the web3 rpc interface "
+            "enabled. Please run it with --jsonrpc-apis=eth,net,web3,parity"
+        )
 
-    See also: https://github.com/mbr/tinyrpc/pull/31 for a proposed upstream
-    fix.
+    try:
+        web3.eth.block_number
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying parity node does not have the eth rpc interface "
+            "enabled. Please run it with --jsonrpc-apis=eth,net,web3,parity"
+        )
 
-    Args:
-        client (pyethapp.rpc_client.JSONRPCClient): the instance to patch
-        pool_maxsize: the maximum poolsize to be used by the `requests.Session()`
+    try:
+        web3.net.version
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying parity node does not have the net rpc interface "
+            "enabled. Please run it with --jsonrpc-apis=eth,net,web3,parity"
+        )
+
+    try:
+        web3.manager.request_blocking(RPCEndpoint("parity_nextNonce"), [NULL_ADDRESS_CHECKSUM])
+    except ValueError:
+        raise EthNodeInterfaceError(
+            "The underlying parity node does not have the parity rpc interface "
+            "enabled. Please run it with --jsonrpc-apis=eth,net,web3,parity"
+        )
+
+
+def parity_discover_next_available_nonce(web3: Web3, address: Address) -> Nonce:
+    """Returns the next available nonce for `address`."""
+    next_nonce_encoded = web3.manager.request_blocking(
+        RPCEndpoint("parity_nextNonce"), [to_checksum_address(address)]
+    )
+    return Nonce(int(next_nonce_encoded, 16))
+
+
+def geth_discover_next_available_nonce(web3: Web3, address: Address) -> Nonce:
+    """Returns the next available nonce for `address`."""
+    return web3.eth.get_transaction_count(address, BLOCK_ID_PENDING)
+
+
+def discover_next_available_nonce(web3: Web3, eth_node: EthClient, address: Address) -> Nonce:
+    """Returns the next available nonce for `address`.
+
+    Nonce discovery had a few iterations:
+
+    - Initially the client fetched the next avaialble nonce before sending
+      every transaction.
+    - Commit e4edcde0ce tried to handle race conditions were two concurrent
+      *local* transactions would use the same nonce, since the nonce was
+      fecthed without synchronization. The strategy was to query it often and
+      update the local state, with the addition of a lock to synchronize its
+      usage.
+    - Commit f750fbd7f7 removed the regular updates, it didn't fix race
+      conditions for *multiple* clients or restarts, and made a requirement
+      that only one app can use the private key at the time. This removed
+      remote race conditions.
+    - Commit d3d204022e started using the txpool interface to account for all
+      sent transactions.
+    - Commit 83f3d8f3bd simplified the nonce update since Geth's API was fixed.
+      And added the special case for Parity.
     """
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_maxsize=pool_maxsize)
-    session.mount(client.transport.endpoint, adapter)
 
-    def send_message(message, expect_reply=True):
-        if not isinstance(message, str):
-            raise TypeError('str expected')
+    if eth_node is EthClient.PARITY:
+        parity_assert_rpc_interfaces(web3)
+        available_nonce = parity_discover_next_available_nonce(web3, address)
 
-        r = session.post(
-            client.transport.endpoint,
-            data=message,
-            **client.transport.request_kwargs
+    elif eth_node is EthClient.GETH:
+        geth_assert_rpc_interfaces(web3)
+        available_nonce = geth_discover_next_available_nonce(web3, address)
+
+    return available_nonce
+
+
+def check_address_has_code(
+    client: "JSONRPCClient",
+    address: Address,
+    contract_name: str,
+    given_block_identifier: BlockIdentifier,
+    expected_code: bytes = None,
+) -> None:
+    """Checks that the given address contains code.
+
+    Use this function to detect errors prior to sending transactions, which is
+    faster to interact and easier to debug. These are the problem that can be
+    prevented:
+
+    - Ensure the target address indeed has code. Otherwise transaction would
+      fail to execute.
+    - Ensure the smart contract exists for the expected time frame. This can be
+      important to verify the metadata is correct, which is necessary to reduce
+      the range which events are queried, and also to detect bugs were a piece
+      of code tries to interact with a smart contract that has not finished
+      deploying.
+    - If possible, check the bytecode of the target smart contract. This is
+      important because it will validate the smart contract ABI (assuming the
+      metadata is correct). Invalid ABI lead to subtle hard to debug bugs.
+    """
+    if is_bytes(given_block_identifier):
+        assert isinstance(given_block_identifier, bytes), MYPY_ANNOTATION
+        block_hash = encode_hex(given_block_identifier)
+        given_block_identifier = client.web3.eth.getBlock(block_hash)["number"]
+
+    result = client.web3.eth.get_code(address, given_block_identifier)
+
+    if not result:
+        # The error message is printed to the user from ui/cli.py. Make sure it
+        # is readable.
+        raise AddressWithoutCode(
+            "[{}]Address {} does not contain code".format(
+                contract_name, to_checksum_address(address)
+            )
         )
 
-        if expect_reply:
-            return r.content
+    if expected_code is not None and result != expected_code:
+        # The error message is printed to the user from ui/cli.py. Make sure it
+        # is readable.
+        raise ContractCodeMismatch(
+            f"[{contract_name}] Address {to_checksum_address(address)} has wrong code"
+        )
 
-    client.transport.send_message = send_message
+
+def check_address_has_code_handle_pruned_block(
+    client: "JSONRPCClient",
+    address: Address,
+    contract_name: str,
+    given_block_identifier: BlockIdentifier,
+    expected_code: bytes = None,
+) -> None:
+    """Checks that the given address contains code.
+
+    If `given_block_identifier` points to a pruned block, fallbacks to use
+    `latest` instead.
+    """
+    try:
+        check_address_has_code(
+            client, address, contract_name, given_block_identifier, expected_code
+        )
+    except ValueError:
+        check_address_has_code(client, address, contract_name, "latest", expected_code)
 
 
-def new_filter(jsonrpc_client, contract_address, topics, from_block=None, to_block=None):
-    """ Custom new filter implementation to handle bad encoding from geth rpc. """
-    if isinstance(from_block, int):
-        from_block = hex(from_block)
-    if isinstance(to_block, int):
-        to_block = hex(to_block)
-    json_data = {
-        'fromBlock': from_block if from_block is not None else 'latest',
-        'toBlock': to_block if to_block is not None else 'latest',
-        'address': address_encoder(normalize_address(contract_address)),
+def get_transaction_data(
+    web3: Web3, abi: ABI, function_name: str, args: Any = None, kwargs: Any = None
+) -> str:
+    """Get encoded transaction data"""
+    args = args or list()
+    fn_abi = find_matching_fn_abi(
+        abi=abi, abi_codec=web3.codec, fn_identifier=function_name, args=args, kwargs=kwargs
+    )
+    return encode_transaction_data(
+        web3=web3,
+        fn_identifier=function_name,
+        contract_abi=abi,
+        fn_abi=fn_abi,
+        args=args,
+        kwargs=kwargs,
+    )
+
+
+def gas_price_for_fast_transaction(web3: Web3) -> int:
+    try:
+        # generateGasPrice takes the transaction to be send as an optional argument
+        # but both strategies that we are using (time-based and rpc-based) don't make
+        # use of this argument. It is therefore safe to not provide it at the moment.
+        # This needs to be reevaluated if we use different gas price strategies
+        maybe_price = web3.eth.generateGasPrice()
+        if maybe_price is not None:
+            price = int(maybe_price)
+        else:
+            price = int(web3.eth.gasPrice)
+    except AttributeError:  # workaround for Infura gas strategy key error
+        # As per https://github.com/raiden-network/raiden/issues/3201
+        # we can sporadically get an AtttributeError here. If that happens
+        # use latest gas price
+        price = int(web3.eth.gasPrice)
+    except IndexError:  # work around for a web3.py exception when
+        # the blockchain is somewhat empty.
+        # https://github.com/ethereum/web3.py/issues/1149
+        price = int(web3.eth.gasPrice)
+
+    return price
+
+
+class ClientErrorInspectResult(Enum):
+    """Represents the action to follow after inspecting a client exception"""
+
+    PROPAGATE_ERROR = 1
+    INSUFFICIENT_FUNDS = 2
+    TRANSACTION_UNDERPRICED = 3
+    TRANSACTION_PENDING = 4
+    ALWAYS_FAIL = 5
+    TRANSACTION_ALREADY_IMPORTED = 7
+    TRANSACTION_PENDING_OR_ALREADY_IMPORTED = 8
+
+
+# Geth has one error message for resending a transaction from the transaction
+# pool, and another for reusing a nonce of a mined transaction. Parity on the
+# other hand has just a single error message, so these errors have to be
+# grouped. (Tested with Geth 1.9.6 and Parity 2.5.9).
+THE_NONCE_WAS_REUSED = (
+    ClientErrorInspectResult.TRANSACTION_PENDING,
+    ClientErrorInspectResult.TRANSACTION_ALREADY_IMPORTED,
+    ClientErrorInspectResult.TRANSACTION_PENDING_OR_ALREADY_IMPORTED,
+)
+
+
+def inspect_client_error(
+    val_err: ValueError, eth_node: Optional[EthClient]
+) -> ClientErrorInspectResult:
+    # both clients return invalid json. They use single quotes while json needs double ones.
+    # Also parity may return something like: 'data': 'Internal("Error message")' which needs
+    # special processing
+    json_response = str(val_err).replace("'", '"').replace('("', "(").replace('")', ")")
+    try:
+        error = json.loads(json_response)
+    except json.JSONDecodeError:
+        return ClientErrorInspectResult.PROPAGATE_ERROR
+
+    if eth_node is EthClient.GETH:
+        if error["code"] == -32000:
+            if "insufficient funds" in error["message"]:
+                return ClientErrorInspectResult.INSUFFICIENT_FUNDS
+
+            if (
+                "always failing transaction" in error["message"]
+                or "execution reverted" in error["message"]
+                or "invalid opcode: opcode 0xfe not defined" in error["message"]
+            ):
+                return ClientErrorInspectResult.ALWAYS_FAIL
+
+            if "replacement transaction underpriced" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_UNDERPRICED
+
+            if "known transaction:" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_PENDING
+
+            # Seems to be a new message in geth 1.9.11
+            if "already know" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_PENDING
+
+            if "nonce too low" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_ALREADY_IMPORTED
+
+    elif eth_node is EthClient.PARITY:
+        if error["code"] == -32010:
+            if "Insufficient funds" in error["message"]:
+                return ClientErrorInspectResult.INSUFFICIENT_FUNDS
+
+            if "another transaction with same nonce in the queue" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_UNDERPRICED
+
+            # This error code is known to be used for pending transactions, it
+            # may also be used for reusing the nonce of mined transactions.
+            if "Transaction nonce is too low. Try incrementing the nonce." in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_PENDING_OR_ALREADY_IMPORTED
+
+            # This error code is used for both resending pending transactions
+            # and reusing nonce of mined transactions.
+            if "Transaction with the same hash was already imported" in error["message"]:
+                return ClientErrorInspectResult.TRANSACTION_PENDING_OR_ALREADY_IMPORTED
+
+        elif error["code"] == -32015 and "Transaction execution error" in error["message"]:
+            return ClientErrorInspectResult.ALWAYS_FAIL
+
+    return ClientErrorInspectResult.PROPAGATE_ERROR
+
+
+class CallType(Enum):
+    ESTIMATE_GAS = 1
+    CALL = 2
+
+
+def check_value_error(value_error: ValueError, call_type: CallType) -> bool:
+    """
+    For parity and geth >= v1.9.15, failing calls and functions do not return
+    None if the transaction will fail but instead throw a ValueError exception.
+
+    This function checks the thrown exception to see if it's the correct one and
+    if yes returns True, if not returns False
+    """
+    try:
+        error_data = json.loads(str(value_error).replace("'", '"'))
+    except json.JSONDecodeError:
+        return False
+
+    expected_errors = {
+        CallType.ESTIMATE_GAS: [
+            # parity
+            (-32016, "The execution failed due to an exception"),
+        ],
+        CallType.CALL: [
+            # geth
+            (-32000, "invalid opcode: opcode 0xfe not defined"),
+            (-32000, "execution reverted"),
+            # parity
+            (-32015, "VM execution error"),
+        ],
     }
 
-    if topics is not None:
-        json_data['topics'] = [
-            topic_encoder(topic)
-            for topic in topics
-        ]
+    if call_type not in expected_errors:
+        raise ValueError("Called check_value_error() with illegal call type")
 
-    return jsonrpc_client.call('eth_newFilter', json_data)
+    for expected_code, expected_msg in expected_errors[call_type]:
+        if error_data["code"] == expected_code and expected_msg in error_data["message"]:
+            return True
 
-
-def decode_topic(topic):
-    return int(topic[2:], 16)
+    return False
 
 
-def estimate_and_transact(classobject, callobj, *args):
-    """Estimate gas using eth_estimateGas. Multiply by 2 to make sure sufficient gas is provided
-    Limit maximum gas to GAS_LIMIT to avoid exceeding blockgas limit
+def is_infura(web3: Web3) -> bool:
+    return (
+        isinstance(web3.provider, HTTPProvider)
+        and web3.provider.endpoint_uri is not None
+        and "infura.io" in web3.provider.endpoint_uri
+    )
+
+
+def patched_web3_eth_estimate_gas(
+    self: Any, transaction: TxParams, block_identifier: BlockIdentifier = None
+) -> Wei:
+    if "from" not in transaction and is_checksum_address(self.default_account):
+        transaction = assoc(transaction, "from", self.default_account)
+
+    if block_identifier is None:
+        params: List[Any] = [transaction]
+    else:
+        params = [transaction, block_identifier]
+
+    try:
+        result = self.web3.manager.request_blocking(RPCEndpoint("eth_estimateGas"), params)
+    except ValueError as e:
+        if check_value_error(e, CallType.ESTIMATE_GAS):
+            result = None
+        else:
+            # else the error is not denoting estimate gas failure and is something else
+            raise e
+    except ReadTimeout:
+        result = None
+
+    return result
+
+
+def patched_web3_eth_call(
+    self: Any, transaction: Dict[str, Any], block_identifier: BlockIdentifier = None
+) -> HexBytes:
+    if "from" not in transaction and is_checksum_address(self.default_account):
+        transaction = assoc(transaction, "from", self.default_account)
+
+    if block_identifier is None:
+        block_identifier = self.defaultBlock
+
+    try:
+        result = self.web3.manager.request_blocking(
+            RPCEndpoint("eth_call"), [transaction, block_identifier]
+        )
+    except ValueError as e:
+        if check_value_error(e, CallType.CALL):
+            result = ""
+        else:
+            # else the error is not denoting a revert, something is wrong
+            raise e
+
+    return HexBytes(result)
+
+
+def estimate_gas_for_function(
+    address: Address,
+    web3: Web3,
+    fn_identifier: str,
+    transaction: TxParams = None,
+    contract_abi: ABI = None,
+    fn_abi: ABIFunction = None,
+    block_identifier: BlockIdentifier = None,
+    *args: Any,
+    **kwargs: Any,
+) -> int:
+    """Temporary workaround until next web3.py release (5.X.X)"""
+    estimate_transaction = prepare_transaction(
+        address=to_checksum_address(address),
+        web3=web3,
+        fn_identifier=fn_identifier,
+        contract_abi=contract_abi,
+        fn_abi=fn_abi,
+        transaction=transaction,
+        fn_args=args,
+        fn_kwargs=kwargs,
+    )
+
+    try:
+        gas_estimate = web3.eth.estimateGas(estimate_transaction, block_identifier)
+    except ValueError as e:
+        if check_value_error(e, CallType.ESTIMATE_GAS):
+            gas_estimate = Wei(0)
+        else:
+            # else the error is not denoting estimate gas failure and is something else
+            raise e
+
+    return gas_estimate
+
+
+def patched_contractfunction_estimateGas(
+    self: Any, transaction: TxParams = None, block_identifier: BlockIdentifier = None
+) -> int:
+    if transaction is None:
+        estimate_gas_transaction: TxParams = {}
+    else:
+        estimate_gas_transaction = transaction
+
+    if "data" in estimate_gas_transaction:
+        raise ValueError("Cannot set data in estimateGas transaction")
+    if "to" in estimate_gas_transaction:
+        raise ValueError("Cannot set to in estimateGas transaction")
+
+    if self.address:
+        estimate_gas_transaction.setdefault("to", self.address)
+    if self.web3.eth.default_account is not empty:
+        estimate_gas_transaction.setdefault("from", self.web3.eth.default_account)
+
+    if "to" not in estimate_gas_transaction:
+        if isinstance(self, type):
+            raise ValueError(
+                "When using `Contract.estimateGas` from a contract factory "
+                "you must provide a `to` address with the transaction"
+            )
+        else:
+            raise ValueError("Please ensure that this contract instance has an address.")
+
+    return estimate_gas_for_function(
+        self.address,
+        self.web3,
+        self.function_identifier,
+        estimate_gas_transaction,
+        self.contract_abi,
+        self.abi,
+        block_identifier,
+        *self.args,
+        **self.kwargs,
+    )
+
+
+def make_sane_poa_middleware(
+    make_request: Callable[[RPCEndpoint, Any], Any], web3: Web3  # pylint: disable=unused-argument
+) -> Callable[[RPCEndpoint, Any], RPCResponse]:
+    """Simpler geth_poa_middleware that doesn't break with ``null`` responses."""
+
+    def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
+        response = make_request(method, params)
+        result = response.get("result")
+        is_get_block_poa = (
+            method.startswith("eth_getBlockBy")
+            and result is not None
+            and len(result["extraData"]) != EXTRA_DATA_LENGTH
+        )
+        if is_get_block_poa:
+            extra_data = result.pop("extraData")
+            response["result"] = {**result, "proofOfAuthorityData": HexBytes(extra_data)}
+        return response
+
+    return middleware
+
+
+def make_patched_web3_get_block(
+    original_func: Callable[[BlockIdentifier, bool], BlockData]
+) -> Callable[[BlockIdentifier, bool], BlockData]:
+    """Patch Eth.getBlock() to retry in case of ``BlockNotFound``
+
+    Infura sometimes erroneously returns a `null` response for
+    ``eth_getBlockByNumber`` and ``eth_getBlockByHash`` for existing blocks.
+
+    This generates a wrapper method that tries to perform the request up to
+    ``WEB3_BLOCK_NOT_FOUND_RETRY_COUNT`` times.
+
+    If no result is returned after the final retry the last ``BlockNotFound`` exception is
+    re-raised.
+
+    See:
+      - https://github.com/raiden-network/raiden/issues/3201
+      - https://github.com/INFURA/infura/issues/43
     """
-    estimated_gas = callobj.estimate_gas(
-        *args,
-        startgas=classobject.startgas,
-        gasprice=classobject.gasprice
-    )
-    estimated_gas = min(estimated_gas * 2, GAS_LIMIT)
-    transaction_hash = callobj.transact(
-        *args,
-        startgas=estimated_gas,
-        gasprice=classobject.gasprice
-    )
-    return transaction_hash
+
+    def patched_web3_get_block(
+        block_identifier: BlockIdentifier, full_transactions: bool = False
+    ) -> BlockData:
+        last_ex: Optional[Exception] = None
+        for remaining_retries in range(WEB3_BLOCK_NOT_FOUND_RETRY_COUNT, 0, -1):
+            try:
+                return original_func(block_identifier, full_transactions)
+            except BlockNotFound as ex:
+                log.warning(
+                    "Block not found, retrying",
+                    remaining_retries=remaining_retries - 1,
+                    block_identifier=block_identifier,
+                )
+                last_ex = ex
+                # Short delay
+                gevent.sleep(0.1)
+        assert last_ex, "Retries can only happen due to exceptions"
+        raise last_ex
+
+    return patched_web3_get_block
 
 
-class BlockChainService(object):
-    """ Exposes the blockchain's state through JSON-RPC. """
-    # pylint: disable=too-many-instance-attributes
+def monkey_patch_web3(web3: Web3, gas_price_strategy: Callable) -> None:
+    try:
+        # install caching middleware
+        web3.middleware_onion.add(block_hash_cache_middleware)
+        web3.middleware_onion.add(simple_cache_middleware)
+
+        # set gas price strategy
+        web3.eth.setGasPriceStrategy(gas_price_strategy)
+
+        # we use a PoA chain for the smoke, unit and integration tests
+        # The built-in `geth_poa_middleware` doesn't correctly deal with `null` responses
+        # to `eth_getBlockBy*` calls.
+        web3.middleware_onion.inject(make_sane_poa_middleware, layer=0)
+    except ValueError:
+        # `middleware_onion.inject()` raises a value error if the same middleware is
+        # injected twice. This happens with `eth-tester` setup where a single session
+        # scoped web3 instance is used for all clients
+        pass
+
+    # We need these so that we can check for exceptions that are expected.
+    # See the docstring of check_value_error for details.
+    ContractFunction.estimateGas = patched_contractfunction_estimateGas  # type: ignore
+    Eth.estimateGas = patched_web3_eth_estimate_gas  # type: ignore
+
+    # Patch call() to achieve same behaviour between parity and geth
+    # At the moment geth returns '' for reverted/thrown transactions.
+    # Parity raises a value error. Raiden assumes the return of an empty
+    # string so we have to make parity behave like geth
+    Eth.call = patched_web3_eth_call  # type: ignore
+
+    if is_infura(web3):
+        # Infura sometimes erroneously returns `null` for existing (but very recent) blocks.
+        # Work around this by retrying those requests.
+        # See docstring for details.
+        web3.eth.getBlock = make_patched_web3_get_block(web3.eth.getBlock)
+
+
+@dataclass
+class EthTransfer:
+    to_address: Address
+    value: int
+    gas_price: int
+
+    def __post_init__(self) -> None:
+        typecheck(self.to_address, T_Address)
+        typecheck(self.gas_price, int)
+        typecheck(self.value, int)
+
+    def to_log_details(self) -> Dict[str, Any]:
+        return {
+            "to_address": to_checksum_address(self.to_address),
+            "value": self.value,
+            "gas_price": self.gas_price,
+        }
+
+
+@dataclass
+class SmartContractCall:
+    contract: Contract
+    function: str
+    args: Iterable[Any]
+    kwargs: Dict[str, Any]
+    value: int
+
+    def __post_init__(self) -> None:
+        typecheck(self.contract, Contract)
+        typecheck(self.function, str)
+        typecheck(self.value, int)
+
+    def to_log_details(self) -> Dict[str, Any]:
+        # As of web3 5.7.0 the typing of `Contract.address` is incorrect. The
+        # value is not always a `str`, it can also be `bytes`.
+        to_address = to_checksum_address(self.contract.address)  # type: ignore
+
+        return {
+            "function_name": self.function,
+            "to_address": to_address,
+            "args": self.args,
+            "kwargs": self.kwargs,
+            "value": self.value,
+        }
+
+
+@dataclass
+class ByteCode:
+    contract_name: str
+    bytecode: bytes
+
+    def to_log_details(self) -> Dict[str, Any]:
+        return {"contract_name": self.contract_name}
+
+
+@dataclass
+class TransactionPending:
+    from_address: Address
+    data: SmartContractCall
+    eth_node: Optional[EthClient]
+    extra_log_details: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        typecheck(self.from_address, T_Address)
+        typecheck(self.data, SmartContractCall)
+
+        self.extra_log_details.setdefault("token", str(uuid4()))
+
+        log.debug("Transaction created", **self.to_log_details())
+
+    def to_log_details(self) -> Dict[str, Any]:
+        log_details = self.data.to_log_details()
+        log_details.update(self.extra_log_details)
+        log_details.update(
+            {"from_address": to_checksum_address(self.from_address), "eth_node": self.eth_node}
+        )
+        return log_details
+
+    def estimate_gas(
+        self, block_identifier: Optional[BlockIdentifier]
+    ) -> Optional["TransactionEstimated"]:
+        """Estimate the gas and price necessary to run the transaction.
+
+        Returns `None` transaction would fail because it hit an assert/require,
+        or if the amount of gas required is larger than the block gas limit.
+        """
+
+        fn = getattr(self.data.contract.functions, self.data.function)
+        from_address = to_checksum_address(self.from_address)
+
+        if self.eth_node is EthClient.GETH:
+            # Unfortunately geth does not follow the ethereum JSON-RPC spec and
+            # does not accept a block identifier argument for eth_estimateGas
+            # parity and py-evm (trinity) do.
+            #
+            # Geth only runs estimateGas on the pending block and that's why we
+            # should also enforce parity, py-evm and others to do the same since
+            # we can't customize geth.
+            #
+            # Spec: https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_estimategas
+            # Geth Issue: https://github.com/ethereum/go-ethereum/issues/2586
+            # Relevant web3 PR: https://github.com/ethereum/web3.py/pull/1046
+            block_identifier = None
+
+        try:
+            estimated_gas = fn(*self.data.args, **self.data.kwargs).estimateGas(
+                transaction={"from": from_address}, block_identifier=block_identifier
+            )
+        except ValueError as err:
+            estimated_gas = None
+            inspected_error = inspect_client_error(err, self.eth_node)
+
+            # These errors are expected to happen. For these errors instead of
+            # propagating the `ValueError` raised by web3 `None` is returned,
+            # this forces the caller to handle the error.
+            expected_error = inspected_error in (
+                ClientErrorInspectResult.INSUFFICIENT_FUNDS,
+                ClientErrorInspectResult.ALWAYS_FAIL,
+            )
+            if not expected_error:
+                raise err
+
+        block = self.data.contract.web3.eth.getBlock(BLOCK_ID_LATEST)
+
+        if estimated_gas is not None:
+            gas_price = gas_price_for_fast_transaction(self.data.contract.web3)
+
+            transaction_estimated = TransactionEstimated(
+                from_address=self.from_address,
+                eth_node=self.eth_node,
+                data=self.data,
+                extra_log_details=self.extra_log_details,
+                estimated_gas=safe_gas_limit(estimated_gas),
+                gas_price=gas_price,
+                approximate_block=(BlockHash(block["hash"]), BlockNumber(block["number"])),
+            )
+
+            log.debug(
+                "Transaction gas estimated",
+                **transaction_estimated.to_log_details(),
+                node_gas_price=self.data.contract.web3.eth.gasPrice,
+            )
+
+            return transaction_estimated
+        else:
+            log.debug(
+                "Transaction gas estimation failed",
+                approximate_block_hash=to_hex(block["hash"]),
+                approximate_block_number=block["number"],
+                **self.to_log_details(),
+            )
+
+            return None
+
+
+@dataclass
+class TransactionEstimated:
+    from_address: Address
+    data: Union[SmartContractCall, ByteCode]
+    eth_node: Optional[EthClient]
+    extra_log_details: Dict[str, Any]
+    estimated_gas: int
+    gas_price: int
+    approximate_block: Tuple[BlockHash, BlockNumber]
+
+    def __post_init__(self) -> None:
+        self.extra_log_details.setdefault("token", str(uuid4()))
+
+        typecheck(self.from_address, T_Address)
+        typecheck(self.data, (SmartContractCall, ByteCode))
+        typecheck(self.estimated_gas, int)
+        typecheck(self.gas_price, int)
+
+    def to_log_details(self) -> Dict[str, Any]:
+        log_details = self.data.to_log_details()
+        log_details.update(self.extra_log_details)
+        log_details.update(
+            {
+                "from_address": to_checksum_address(self.from_address),
+                "eth_node": self.eth_node,
+                "estimated_gas": self.estimated_gas,
+                "gas_price": self.gas_price,
+                "approximate_block_hash": to_hex(self.approximate_block[0]),
+                "approximate_block_number": self.approximate_block[1],
+            }
+        )
+        return log_details
+
+
+# Type used to expose the attributes for type checking, the actual
+# implementation is hidden and can only be instantiated through the
+# JSONRPCClient, which ensures the nonces are used sequentially.
+class TransactionSent(ABC):
+    from_address: Address
+    data: Union[SmartContractCall, ByteCode, EthTransfer]
+    eth_node: Optional[EthClient]
+    extra_log_details: Dict[str, Any]
+    startgas: int
+    gas_price: int
+    nonce: Nonce
+    transaction_hash: TransactionHash
+    chain_id: ChainID
+
+
+@dataclass
+class TransactionMined:
+    from_address: Address
+    data: Union[SmartContractCall, ByteCode, EthTransfer]
+    eth_node: Optional[EthClient]
+    extra_log_details: Dict[str, Any]
+    startgas: int
+    gas_price: int
+    nonce: Nonce
+    transaction_hash: TransactionHash
+    receipt: TxReceipt
+    chain_id: ChainID
+
+
+class JSONRPCClient:
+    """Ethereum JSON RPC client."""
 
     def __init__(
-            self,
-            privatekey_bin,
-            registry_address,
-            host,
-            port,
-            poll_timeout=DEFAULT_POLL_TIMEOUT,
-            **kwargs):
+        self,
+        web3: Web3,
+        privkey: PrivateKey,
+        gas_price_strategy: Callable = rpc_gas_price_strategy,
+        block_num_confirmations: int = 0,
+    ) -> None:
+        if len(privkey) != 32:
+            raise ValueError("Invalid private key")
 
-        self.address_token = dict()
-        self.address_discovery = dict()
-        self.address_manager = dict()
-        self.address_contract = dict()
-        self.address_registry = dict()
-        self.token_manager = dict()
+        if block_num_confirmations < 0:
+            raise ValueError("Number of confirmations has to be positive")
 
-        jsonrpc_client = JSONRPCClient(
-            privkey=privatekey_bin,
-            host=host,
-            port=port,
-            print_communication=kwargs.get('print_communication', False),
+        monkey_patch_web3(web3, gas_price_strategy)
+
+        version = web3.clientVersion
+        supported, eth_node, _ = is_supported_client(version)
+
+        if eth_node is None or supported is VersionSupport.UNSUPPORTED:
+            raise EthNodeInterfaceError(f'Unsupported Ethereum client "{version}"')
+        if supported is VersionSupport.WARN:
+            log.warning(f'Unsupported Ethereum client version "{version}"')
+
+        address = privatekey_to_address(privkey)
+        available_nonce = discover_next_available_nonce(web3, eth_node, address)
+
+        self.eth_node = eth_node
+        self.privkey = privkey
+        self.address = address
+        self.web3 = web3
+        self.default_block_num_confirmations = block_num_confirmations
+
+        # Ask for the chain id only once and store it here
+        self.chain_id = ChainID(self.web3.eth.chain_id)
+
+        self._available_nonce = available_nonce
+        self._nonce_lock = Semaphore()
+
+        log.debug(
+            "JSONRPCClient created",
+            node=to_checksum_address(self.address),
+            available_nonce=available_nonce,
+            client=version,
         )
-        patch_send_transaction(jsonrpc_client)
-        patch_send_message(jsonrpc_client)
 
-        self.client = jsonrpc_client
-        self.private_key = privatekey_bin
-        self.node_address = privatekey_to_address(privatekey_bin)
-        self.poll_timeout = poll_timeout
-        self.default_registry = self.registry(registry_address)
+    def __repr__(self) -> str:
+        return (
+            f"<JSONRPCClient "
+            f"node:{to_checksum_address(self.address)} nonce:{self._available_nonce}"
+            f">"
+        )
 
-    def set_verbosity(self, level):
-        if level:
-            self.client.print_communication = True
+    def block_number(self) -> BlockNumber:
+        """Return the most recent block."""
+        return self.web3.eth.block_number
 
-    def block_number(self):
-        return self.client.blocknumber()
+    def get_block(self, block_identifier: BlockIdentifier) -> BlockData:
+        """Given a block number, query the chain to get its corresponding block hash"""
+        return self.web3.eth.getBlock(block_identifier)
 
-    def estimate_blocktime(self, oldest=256):
-        """Calculate a blocktime estimate based on some past blocks.
-        Args:
-            oldest (int): delta in block numbers to go back.
-        Return:
-            average block time (int) in seconds
+    def get_confirmed_blockhash(self) -> BlockHash:
+        """Gets the block CONFIRMATION_BLOCKS in the past and returns its block hash"""
+        confirmed_block_number = BlockNumber(
+            self.web3.eth.block_number - self.default_block_num_confirmations
+        )
+        if confirmed_block_number < 0:
+            confirmed_block_number = BlockNumber(0)
+
+        return self.blockhash_from_blocknumber(confirmed_block_number)
+
+    def blockhash_from_blocknumber(self, block_number: BlockIdentifier) -> BlockHash:
+        """Given a block number, query the chain to get its corresponding block hash"""
+        block = self.get_block(block_number)
+        return BlockHash(bytes(block["hash"]))
+
+    def can_query_state_for_block(self, block_identifier: BlockIdentifier) -> bool:
         """
-        last_block_number = self.block_number()
-        # around genesis block there is nothing to estimate
-        if last_block_number < 1:
-            return 15
-        # if there are less than `oldest` blocks available, start at block 1
-        if last_block_number < oldest:
-            interval = (last_block_number - 1) or 1
-        else:
-            interval = last_block_number - oldest
-        assert interval > 0
-        last_timestamp = int(self.get_block_header(last_block_number)['timestamp'], 16)
-        first_timestamp = int(self.get_block_header(last_block_number - interval)['timestamp'], 16)
-        delta = last_timestamp - first_timestamp
-        return float(delta) / interval
+        Returns if the provided block identifier is safe enough to query chain
+        state for. If it's close to the state pruning blocks then state should
+        not be queried.
+        More info: https://github.com/raiden-network/raiden/issues/3566.
+        """
+        latest_block_number = self.block_number()
+        preconditions_block = self.web3.eth.getBlock(block_identifier)
+        preconditions_block_number = int(preconditions_block["number"])
+        difference = latest_block_number - preconditions_block_number
+        return difference < NO_STATE_QUERY_AFTER_BLOCKS
 
-    def get_block_header(self, block_number):
-        block_number = block_tag_encoder(block_number)
-        return self.client.call('eth_getBlockByNumber', block_number, False)
+    # FIXME: shouldn't return `TokenAmount`
+    def balance(self, account: Address) -> TokenAmount:
+        """Return the balance of the account of the given address."""
+        return TokenAmount(self.web3.eth.get_balance(account, BLOCK_ID_PENDING))
 
-    def next_block(self):
-        target_block_number = self.block_number() + 1
-        current_block = target_block_number
+    def parity_get_pending_transaction_hash_by_nonce(
+        self, address: AddressHex, nonce: Nonce
+    ) -> Optional[TransactionHash]:
+        """Queries the local parity transaction pool and searches for a transaction.
 
-        while not current_block >= target_block_number:
+        Checks the local tx pool for a transaction from a particular address and for
+        a given nonce. If it exists it returns the transaction hash.
+        """
+        msg = {
+            "`parity` specific function must only be called when the client is parity. "
+            f"Client was {self.eth_node}."
+        }
+        assert self.eth_node is EthClient.PARITY, msg
+        # https://wiki.parity.io/JSONRPC-parity-module.html?q=traceTransaction#parity_alltransactions
+        transactions = self.web3.manager.request_blocking(
+            RPCEndpoint("parity_allTransactions"), []
+        )
+        log.debug("RETURNED TRANSACTIONS", transactions=transactions)
+        for tx in transactions:
+            address_match = tx["from"] == address
+            if address_match and int(tx["nonce"], 16) == nonce:
+                return tx["hash"]
+        return None
+
+    def estimate_gas(
+        self,
+        contract: Contract,
+        function: str,
+        extra_log_details: Dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Optional[TransactionEstimated]:
+        pending = TransactionPending(
+            from_address=self.address,
+            data=SmartContractCall(contract, function, args, kwargs, value=0),
+            eth_node=self.eth_node,
+            extra_log_details=extra_log_details,
+        )
+        return pending.estimate_gas(BLOCK_ID_PENDING)
+
+    def transact(self, transaction: Union[TransactionEstimated, EthTransfer]) -> TransactionSent:
+        """Allocates an unique `nonce` and send the transaction to the blockchain.
+
+        This can fail for a few reasons:
+
+        - The account doesn't have sufficient Eth to pay for the gas.
+        - The gas price was too low.
+        - Another transaction with the same `nonce` was sent before. This may
+          happen because:
+          - Another application is using the same private key.
+          - The node restarted and the `nonce` recovered by
+            `discover_next_available_nonce` was too low, which can happend
+            because:
+            - The transactions currenlty in the pool are not taken into
+              account.
+            - There was a gap in the `nonce`s of the transaction in the pool,
+              once the gap is filled a `nonce` is reused. This is most likely a
+              bug.
+        """
+
+        # Exposing the JSONRPCClient with a nice name for the instance closure.
+        client = self
+
+        @dataclass
+        class TransactionSlot:
+            from_address: Address
+            data: Union[SmartContractCall, ByteCode, EthTransfer]
+            eth_node: Optional[EthClient]
+            extra_log_details: Dict[str, Any]
+            startgas: int
+            gas_price: int
+            nonce: Nonce
+
+            def __post_init__(self) -> None:
+                self.extra_log_details.setdefault("token", str(uuid4()))
+
+                typecheck(self.from_address, T_Address)
+                typecheck(self.data, (SmartContractCall, ByteCode, EthTransfer))
+                typecheck(self.startgas, int)
+                typecheck(self.gas_price, int)
+                typecheck(self.nonce, T_Nonce)
+
+            def to_log_details(self) -> Dict[str, Any]:
+                log_details = self.data.to_log_details()
+                log_details.update(self.extra_log_details)
+                log_details.update(
+                    {
+                        "node": to_checksum_address(client.address),
+                        "from_address": to_checksum_address(self.from_address),
+                        "eth_node": self.eth_node,
+                        "startgas": self.startgas,
+                        "gas_price": self.gas_price,
+                        "nonce": self.nonce,
+                    }
+                )
+                return log_details
+
+        # The class is hidden in the method to force this method to be called,
+        # this is necessary to enforce the monotonicity of the `nonce`.
+        @dataclass
+        class TransactionSentImplementation(TransactionSent):
+            from_address: Address
+            data: Union[SmartContractCall, ByteCode, EthTransfer]
+            eth_node: Optional[EthClient]
+            extra_log_details: Dict[str, Any]
+            startgas: int
+            gas_price: int
+            nonce: Nonce
+            transaction_hash: TransactionHash
+            chain_id: ChainID
+
+            def __post_init__(self) -> None:
+                self.extra_log_details.setdefault("token", str(uuid4()))
+
+                typecheck(self.from_address, T_Address)
+                typecheck(self.data, (SmartContractCall, ByteCode, EthTransfer))
+                typecheck(self.startgas, int)
+                typecheck(self.gas_price, int)
+                typecheck(self.nonce, T_Nonce)
+                typecheck(self.transaction_hash, T_TransactionHash)
+                typecheck(self.chain_id, T_ChainID)
+
+            def to_log_details(self) -> Dict[str, Any]:
+                log_details = self.data.to_log_details()
+                log_details.update(self.extra_log_details)
+                log_details.update(
+                    {
+                        "node": to_checksum_address(client.address),
+                        "from_address": to_checksum_address(self.from_address),
+                        "eth_node": self.eth_node,
+                        "startgas": self.startgas,
+                        "gas_price": self.gas_price,
+                        "nonce": self.nonce,
+                        "transaction_hash": encode_hex(self.transaction_hash),
+                        "chain_id": self.chain_id,
+                    }
+                )
+                return log_details
+
+        try:
+            with self._nonce_lock:
+                # This value can only be updated after the transaction is sent, the
+                # lock has to be held until then.
+                available_nonce = self._available_nonce
+
+                # A EthTransfer doesn't need gas estimation, it should always
+                # use the `TRANSACTION_INTRINSIC_GAS`. This is why it has a
+                # special case.
+                if isinstance(transaction, EthTransfer):
+                    slot = TransactionSlot(
+                        from_address=self.address,
+                        eth_node=self.eth_node,
+                        data=transaction,
+                        extra_log_details={},
+                        startgas=TRANSACTION_INTRINSIC_GAS,
+                        gas_price=transaction.gas_price,
+                        nonce=available_nonce,
+                    )
+                else:
+                    slot = TransactionSlot(
+                        from_address=transaction.from_address,
+                        eth_node=transaction.eth_node,
+                        data=transaction.data,
+                        extra_log_details=transaction.extra_log_details,
+                        startgas=transaction.estimated_gas,
+                        gas_price=transaction.gas_price,
+                        nonce=available_nonce,
+                    )
+
+                log_details = slot.to_log_details()
+
+                if isinstance(slot.data, SmartContractCall):
+                    function_call = slot.data
+                    data = get_transaction_data(
+                        web3=function_call.contract.web3,
+                        abi=function_call.contract.abi,
+                        function_name=function_call.function,
+                        args=function_call.args,
+                        kwargs=function_call.kwargs,
+                    )
+                    transaction_data = {
+                        "data": decode_hex(data),
+                        "gas": slot.startgas,
+                        "nonce": slot.nonce,
+                        "value": slot.data.value,
+                        "to": function_call.contract.address,
+                        "gasPrice": slot.gas_price,
+                        "chainId": self.chain_id,
+                    }
+
+                    log.debug(
+                        "Transaction to call smart contract function will be sent", **log_details
+                    )
+                elif isinstance(slot.data, EthTransfer):
+                    transaction_data = {
+                        "to": to_checksum_address(slot.data.to_address),
+                        "gas": slot.startgas,
+                        "nonce": slot.nonce,
+                        "value": slot.data.value,
+                        "gasPrice": slot.gas_price,
+                        "chainId": self.chain_id,
+                    }
+
+                    log.debug("Transaction to transfer ether will be sent", **log_details)
+                else:
+                    transaction_data = {
+                        "data": slot.data.bytecode,
+                        "gas": slot.startgas,
+                        "nonce": slot.nonce,
+                        "value": 0,
+                        "gasPrice": slot.gas_price,
+                        "chainId": self.chain_id,
+                    }
+
+                    log.debug("Transaction to deploy smart contract will be sent", **log_details)
+
+                signed_txn = client.web3.eth.account.sign_transaction(
+                    transaction_data, client.privkey
+                )
+                tx_hash = client.web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+
+                # Increase the `nonce` only after sending the transaction. This
+                # is necessary because the send itself can fail, e.g. because
+                # of an invalid value which leads to a `ValueError` or if the
+                # received node rejects the transaction. When this happens, the
+                # `_available_nonce` must not be incremented, since that may
+                # lead to gaps in the account's transactions, effectivelly
+                # stalling all transactions until the spare nonce is used.
+                self._available_nonce = Nonce(self._available_nonce + 1)
+
+        except ValueError as e:
+            if isinstance(slot.data, SmartContractCall):
+                error_msg = "Transaction to call smart contract function failed"
+            elif isinstance(slot.data, EthTransfer):
+                error_msg = "Transaction to transfer ether failed"
+            else:  # ByteCode
+                error_msg = "Transaction to deploy smart contract failed"
+
+            action = inspect_client_error(e, self.eth_node)
+
+            if action == ClientErrorInspectResult.INSUFFICIENT_FUNDS:
+                reason = (
+                    "Transaction failed due to insufficient ETH balance. "
+                    "Please top up your ETH account."
+                )
+                log.critical(error_msg, **log_details, reason=reason)
+                raise InsufficientEth(reason)
+
+            if action == ClientErrorInspectResult.TRANSACTION_UNDERPRICED:
+                reason = (
+                    "Transaction was rejected. This is potentially "
+                    "caused by the reuse of the previous transaction "
+                    "nonce as well as paying an amount of gas less than or "
+                    "equal to the previous transaction's gas amount"
+                )
+                log.critical(error_msg, **log_details, reason=reason)
+                raise ReplacementTransactionUnderpriced(reason)
+
+            if action in THE_NONCE_WAS_REUSED:
+                # XXX: Add logic to check if the transactions are the same, and
+                # if they are, instead of raising an unrecoverable error
+                # proceed as normal.
+                #
+                # This was previously done, but removed by #4909, and for it to
+                # be finished #2088 has to be implemented.
+                reason = "Transaction rejected because the nonce has been already mined."
+                log.critical(error_msg, **log_details, reason=reason)
+                raise EthereumNonceTooLow(reason)
+
+            reason = f"Unexpected error in underlying Ethereum node: {str(e)}"
+            log.critical(error_msg, **log_details, reason=reason)
+            raise RaidenUnrecoverableError(reason)
+
+        transaction_sent = TransactionSentImplementation(
+            from_address=slot.from_address,
+            eth_node=slot.eth_node,
+            data=slot.data,
+            extra_log_details=slot.extra_log_details,
+            startgas=slot.startgas,
+            gas_price=slot.gas_price,
+            nonce=slot.nonce,
+            transaction_hash=TransactionHash(tx_hash),
+            chain_id=self.chain_id,
+        )
+        log.debug("Transaction sent", **transaction_sent.to_log_details())
+        return transaction_sent
+
+    def new_contract_proxy(
+        self, abi: ABI, contract_address: Union[Address, ChecksumAddress]
+    ) -> Contract:
+        return self.web3.eth.contract(abi=abi, address=contract_address)
+
+    def deploy_single_contract(
+        self,
+        contract_name: str,
+        contract: CompiledContract,
+        constructor_parameters: Sequence = None,
+    ) -> Tuple[Contract, TxReceipt]:
+        """
+        Deploy a single solidity contract without dependencies.
+
+        Args:
+            contract_name: The name of the contract to compile.
+            contract: The dictionary containing the contract information (like ABI and BIN)
+            constructor_parameters: A tuple of arguments to pass to the constructor.
+        """
+
+        ctor_parameters = constructor_parameters or ()
+
+        contract_object = self.web3.eth.contract(abi=contract["abi"], bytecode=contract["bin"])
+        contract_transaction = contract_object.constructor(*ctor_parameters).buildTransaction()
+        constructor_call = ByteCode(contract_name, contract_transaction["data"])
+
+        block = self.get_block(BLOCK_ID_LATEST)
+
+        # Sometimes eth_estimateGas returns wrong values for contract deployments
+        # Add a margin of 50%
+        # See https://github.com/raiden-network/raiden/issues/5994
+        gas_with_margin = int(contract_transaction["gas"] * 1.5)
+        gas_price = gas_price_for_fast_transaction(self.web3)
+        transaction = TransactionEstimated(
+            from_address=self.address,
+            data=constructor_call,
+            eth_node=self.eth_node,
+            extra_log_details={},
+            estimated_gas=gas_with_margin,
+            gas_price=gas_price,
+            approximate_block=(BlockHash(block["hash"]), block["number"]),
+        )
+
+        transaction_sent = self.transact(transaction)
+        transaction_mined = self.poll_transaction(transaction_sent)
+
+        maybe_contract_address = transaction_mined.receipt["contractAddress"]
+        assert maybe_contract_address is not None, "'contractAddress' not set in receipt"
+        contract_address = to_canonical_address(maybe_contract_address)
+
+        if not was_transaction_successfully_mined(transaction_mined):
+            check_transaction_failure(transaction_mined, self)
+
+            raise RuntimeError(
+                f"Deployment of {contract_name} failed! Most likely a require "
+                f"from the constructor was not satisfied, or there is a "
+                f"compiler bug."
+            )
+
+        deployed_code = self.web3.eth.get_code(contract_address)
+
+        if not deployed_code:
+            raise RaidenUnrecoverableError(
+                f"Contract deployment of {contract_name} was successfull but "
+                f"address has no code! This is likely a bug in the ethereum "
+                f"client."
+            )
+
+        return (
+            self.new_contract_proxy(abi=contract["abi"], contract_address=contract_address),
+            transaction_mined.receipt,
+        )
+
+    def poll_transaction(self, transaction_sent: TransactionSent) -> TransactionMined:
+        """Wait until the `transaction_hash` is mined, confirmed, handling
+        reorgs.
+
+        Consider the following reorg, where a transaction is mined at block B,
+        but it is not mined in the canonical chain A-C-D:
+
+             A -> B   D
+             *--> C --^
+
+        When the Ethereum node looks at block B, from its perspective the
+        transaction is mined and it has a receipt. After the reorg it does not
+        have a receipt. This can happen on PoW and PoA based chains.
+
+        Args:
+            transaction_hash: Transaction hash that we are waiting for.
+        """
+        transaction_hash_hex = encode_hex(transaction_sent.transaction_hash)
+
+        while True:
+            tx_receipt: Optional[TxReceipt] = None
+            try:
+                tx_receipt = self.web3.eth.getTransactionReceipt(transaction_hash_hex)
+            except TransactionNotFound:
+                pass
+
+            # Parity (as of 2.5.7) always returns a receipt. When the
+            # transaction is not mined in the canonical chain, the receipt will
+            # not have meaningful values. Example of receipt for a transaction
+            # that is not mined:
+            #
+            #   blockHash: None
+            #   blockNumber: None
+            #   contractAddress: None
+            #   cumulativeGasUsed: The transaction's gas
+            #   from: None
+            #   gasUsed: The transaction's gas
+            #   logs: []
+            #   logsBloom: Zero is hex
+            #   root: None
+            #   status: 1
+            #   to: None
+            #   transactionHash: The transaction's hash
+            #   transactionIndex: 0
+            #
+            # Geth only returns a receipt if the transaction was mined on the
+            # canonical chain. https://github.com/raiden-network/raiden/issues/4529
+            is_transaction_mined = tx_receipt and tx_receipt.get("blockNumber") is not None
+
+            if is_transaction_mined:
+                assert tx_receipt is not None, MYPY_ANNOTATION
+                confirmation_block = (
+                    tx_receipt["blockNumber"] + self.default_block_num_confirmations
+                )
+                block_number = self.block_number()
+
+                is_transaction_confirmed = block_number >= confirmation_block
+                if is_transaction_confirmed:
+                    transaction_mined = TransactionMined(
+                        from_address=transaction_sent.from_address,
+                        data=transaction_sent.data,
+                        eth_node=transaction_sent.eth_node,
+                        extra_log_details=transaction_sent.extra_log_details,
+                        startgas=transaction_sent.startgas,
+                        gas_price=transaction_sent.gas_price,
+                        nonce=transaction_sent.nonce,
+                        transaction_hash=transaction_sent.transaction_hash,
+                        receipt=tx_receipt,
+                        chain_id=transaction_sent.chain_id,
+                    )
+                    return transaction_mined
+
+            gevent.sleep(1.0)
+
+    def get_filter_events(
+        self,
+        contract_address: Address,
+        topics: List[str] = None,
+        from_block: BlockIdentifier = GENESIS_BLOCK_NUMBER,
+        to_block: BlockIdentifier = BLOCK_ID_LATEST,
+    ) -> List[LogReceipt]:
+        """Get events for the given query."""
+        logs_blocks_sanity_check(from_block, to_block)
+        return self.web3.eth.getLogs(
+            FilterParams(
+                {
+                    "fromBlock": from_block,
+                    "toBlock": to_block,
+                    "address": contract_address,
+                    "topics": topics,  # type: ignore
+                }
+            )
+        )
+
+    def check_for_insufficient_eth(
+        self,
+        transaction_name: str,
+        transaction_executed: bool,
+        required_gas: int,
+        block_identifier: BlockIdentifier,
+    ) -> None:
+        """After estimate gas failure checks if our address has enough balance.
+
+        If the account did not have enough ETH balance to execute the
+        transaction, it raises an `InsufficientEth` error.
+
+        Note:
+            This check contains a race condition, it could be the case that a
+            new block is mined changing the account's balance.
+            https://github.com/raiden-network/raiden/issues/3890#issuecomment-485857726
+        """
+        if transaction_executed:
+            return
+
+        our_address = to_checksum_address(self.address)
+        balance = self.web3.eth.get_balance(our_address, block_identifier)
+        required_balance = required_gas * gas_price_for_fast_transaction(self.web3)
+        if balance < required_balance:
+            msg = f"Failed to execute {transaction_name} due to insufficient ETH"
+            log.critical(msg, required_wei=required_balance, actual_wei=balance)
+            raise InsufficientEth(msg)
+
+    def wait_until_block(
+        self, target_block_number: BlockNumber, retry_timeout: float = 0.5
+    ) -> BlockNumber:
+        current_block = self.block_number()
+
+        while current_block < target_block_number:
             current_block = self.block_number()
-            gevent.sleep(0.5)
+            gevent.sleep(retry_timeout)
 
         return current_block
 
-    def token(self, token_address):
-        """ Return a proxy to interact with a token. """
-        if token_address not in self.address_token:
-            self.address_token[token_address] = Token(
-                self.client,
-                token_address,
-                poll_timeout=self.poll_timeout,
-            )
-
-        return self.address_token[token_address]
-
-    def discovery(self, discovery_address):
-        """ Return a proxy to interact with the discovery. """
-        if discovery_address not in self.address_discovery:
-            self.address_discovery[discovery_address] = Discovery(
-                self.client,
-                discovery_address,
-                poll_timeout=self.poll_timeout,
-            )
-
-        return self.address_discovery[discovery_address]
-
-    def netting_channel(self, netting_channel_address):
-        """ Return a proxy to interact with a NettingChannelContract. """
-        if netting_channel_address not in self.address_contract:
-            channel = NettingChannel(
-                self.client,
-                netting_channel_address,
-                poll_timeout=self.poll_timeout,
-            )
-            self.address_contract[netting_channel_address] = channel
-
-        return self.address_contract[netting_channel_address]
-
-    def manager(self, manager_address):
-        """ Return a proxy to interact with a ChannelManagerContract. """
-        if manager_address not in self.address_manager:
-            manager = ChannelManager(
-                self.client,
-                manager_address,
-                poll_timeout=self.poll_timeout,
-            )
-
-            token_address = manager.token_address()
-
-            self.token_manager[token_address] = manager
-            self.address_manager[manager_address] = manager
-
-        return self.address_manager[manager_address]
-
-    def manager_by_token(self, token_address):
-        """ Find the channel manager for `token_address` and return a proxy to
-        interact with it.
+    def transaction_failed_with_a_require(
+        self, transaction_hash: TransactionHash
+    ) -> Optional[bool]:
+        """Tries to determine if the transaction with `transaction_hash`
+        failed because of a `require` expression.
         """
-        if token_address not in self.token_manager:
-            token = self.token(token_address)  # check that the token exists
-            manager_address = self.default_registry.manager_address_by_token(token.address)
-            manager = ChannelManager(
-                self.client,
-                address_decoder(manager_address),
-                poll_timeout=self.poll_timeout,
-            )
 
-            self.token_manager[token_address] = manager
-            self.address_manager[manager_address] = manager
-
-        return self.token_manager[token_address]
-
-    def registry(self, registry_address):
-        if registry_address not in self.address_registry:
-            self.address_registry[registry_address] = Registry(
-                self.client,
-                registry_address,
-                poll_timeout=self.poll_timeout,
-            )
-
-        return self.address_registry[registry_address]
-
-    def uninstall_filter(self, filter_id_raw):
-        self.client.call('eth_uninstallFilter', filter_id_raw)
-
-    def deploy_contract(self, contract_name, contract_file, constructor_parameters=None):
-        contract_path = get_contract_path(contract_file)
-        contracts = _solidity.compile_file(contract_path, libraries=dict())
-
-        log.info(
-            'Deploying "%s" contract',
-            contract_file,
-        )
-
-        proxy = self.client.deploy_solidity_contract(
-            self.node_address,
-            contract_name,
-            contracts,
-            dict(),
-            constructor_parameters,
-            contract_path=contract_path,
-            gasprice=default_gasprice,
-            timeout=self.poll_timeout,
-        )
-        return proxy.address
-
-    def deploy_and_register_token(self, contract_name, contract_file, constructor_parameters=None):
-        assert self.default_registry
-
-        token_address = self.deploy_contract(
-            contract_name,
-            contract_file,
-            constructor_parameters,
-        )
-        self.default_registry.add_token(token_address)  # pylint: disable=no-member
-
-        return token_address
-
-
-class Filter(object):
-    def __init__(self, jsonrpc_client, filter_id_raw):
-        self.filter_id_raw = filter_id_raw
-        self.client = jsonrpc_client
-
-    def _query_filter(self, function):
-        filter_changes = self.client.call(function, self.filter_id_raw)
-
-        # geth could return None
-        if filter_changes is None:
-            return []
-
-        result = list()
-        for log_event in filter_changes:
-            address = address_decoder(log_event['address'])
-            data = data_decoder(log_event['data'])
-            topics = [
-                decode_topic(topic)
-                for topic in log_event['topics']
-            ]
-
-            result.append({
-                'topics': topics,
-                'data': data,
-                'address': address,
-            })
-
-        return result
-
-    def changes(self):
-        return self._query_filter('eth_getFilterChanges')
-
-    def getall(self):
-        return self._query_filter('eth_getFilterLogs')
-
-    def uninstall(self):
-        self.client.call(
-            'eth_uninstallFilter',
-            self.filter_id_raw,
-        )
-
-
-class Discovery(object):
-    """On chain smart contract raiden node discovery: allows registering
-    endpoints (host, port) for your ethereum-/raiden-address and looking up
-    endpoints for other ethereum-/raiden-addressess.
-    """
-
-    def __init__(
-            self,
-            jsonrpc_client,
-            discovery_address,
-            startgas=GAS_LIMIT,
-            gasprice=GAS_PRICE,
-            poll_timeout=DEFAULT_POLL_TIMEOUT):
-
-        result = jsonrpc_client.call(
-            'eth_getCode',
-            address_encoder(discovery_address),
-            'latest',
-        )
-
-        if result == '0x':
-            raise ValueError('Discovery address {} does not contain code'.format(
-                address_encoder(discovery_address),
-            ))
-
-        proxy = jsonrpc_client.new_abi_contract(
-            ENDPOINT_REGISTRY_ABI,
-            address_encoder(discovery_address),
-        )
-
-        self.address = discovery_address
-        self.proxy = proxy
-        self.client = jsonrpc_client
-        self.startgas = startgas
-        self.gasprice = gasprice
-        self.poll_timeout = poll_timeout
-
-    def register_endpoint(self, node_address, endpoint):
-        if node_address != self.client.sender:
-            raise ValueError("node_address doesnt match this node's address")
-
-        transaction_hash = self.proxy.registerEndpoint.transact(endpoint)
-
-        try:
-            self.client.poll(
-                transaction_hash.decode('hex'),
-                timeout=self.poll_timeout,
-            )
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-    def endpoint_by_address(self, node_address_bin):
-        node_address_hex = node_address_bin.encode('hex')
-        endpoint = self.proxy.findEndpointByAddress.call(node_address_hex)
-
-        if endpoint == '':
-            raise KeyError('Unknown address {}'.format(pex(node_address_bin)))
-
-        return endpoint
-
-    def address_by_endpoint(self, endpoint):
-        address = self.proxy.findAddressByEndpoint.call(endpoint)
-
-        if set(address) == {'0'}:  # the 0 address means nothing found
-            return None
-
-        return address.decode('hex')
-
-
-class Token(object):
-    def __init__(
-            self,
-            jsonrpc_client,
-            token_address,
-            startgas=GAS_LIMIT,
-            gasprice=GAS_PRICE,
-            poll_timeout=DEFAULT_POLL_TIMEOUT):
-
-        result = jsonrpc_client.call(
-            'eth_getCode',
-            address_encoder(token_address),
-            'latest',
-        )
-
-        if result == '0x':
-            raise ValueError('Token address {} does not contain code'.format(
-                address_encoder(token_address),
-            ))
-
-        proxy = jsonrpc_client.new_abi_contract(
-            HUMAN_TOKEN_ABI,
-            address_encoder(token_address),
-        )
-
-        self.address = token_address
-        self.proxy = proxy
-        self.client = jsonrpc_client
-        self.startgas = startgas
-        self.gasprice = gasprice
-        self.poll_timeout = poll_timeout
-
-    def approve(self, contract_address, allowance):
-        """ Aprove `contract_address` to transfer up to `deposit` amount of token. """
-        # TODO: check that `contract_address` is a netting channel and that
-        # `self.address` is one of the participants (maybe add this logic into
-        # `NettingChannel` and keep this straight forward)
-
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.approve,
-            contract_address,
-            allowance,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-    def balance_of(self, address):
-        """ Return the balance of `address`. """
-        return self.proxy.balanceOf.call(address)
-
-    def transfer(self, to_address, amount):
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.transfer,  # pylint: disable=no-member
-            to_address,
-            amount,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'))
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-        # TODO: check Transfer event
-
-
-class Registry(object):
-    def __init__(self, jsonrpc_client, registry_address, startgas=GAS_LIMIT,
-                 gasprice=GAS_PRICE, poll_timeout=DEFAULT_POLL_TIMEOUT):
-        # pylint: disable=too-many-arguments
-
-        result = jsonrpc_client.call(
-            'eth_getCode',
-            address_encoder(registry_address),
-            'latest',
-        )
-
-        if result == '0x':
-            raise ValueError('Registry address {} does not contain code'.format(
-                address_encoder(registry_address),
-            ))
-
-        proxy = jsonrpc_client.new_abi_contract(
-            REGISTRY_ABI,
-            address_encoder(registry_address),
-        )
-
-        self.address = registry_address
-        self.proxy = proxy
-        self.client = jsonrpc_client
-        self.startgas = startgas
-        self.gasprice = gasprice
-        self.poll_timeout = poll_timeout
-
-    def manager_address_by_token(self, token_address):
-        """ Return the channel manager address for the given token. """
-        return self.proxy.channelManagerByToken.call(token_address)
-
-    def add_token(self, token_address):
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.addToken,
-            token_address,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-        channel_manager_address_encoded = self.proxy.channelManagerByToken.call(
-            token_address,
-            startgas=self.startgas,
-        )
-
-        if not channel_manager_address_encoded:
-            log.error('add_token failed', token_address=pex(token_address))
-            raise RuntimeError('add_token failed')
-
-        channel_manager_address_bin = address_decoder(channel_manager_address_encoded)
-
-        log.info(
-            'add_token called',
-            token_address=pex(token_address),
-            registry_address=pex(self.address),
-            channel_manager_address=pex(channel_manager_address_bin),
-        )
-
-    def token_addresses(self):
-        return [
-            address_decoder(address)
-            for address in self.proxy.tokenAddresses.call(startgas=self.startgas)
-        ]
-
-    def manager_addresses(self):
-        return [
-            address_decoder(address)
-            for address in self.proxy.channelManagerAddresses.call(startgas=self.startgas)
-        ]
-
-    def tokenadded_filter(self, from_block=None, to_block=None):
-        topics = [TOKENADDED_EVENTID]
-
-        registry_address_bin = self.proxy.address
-        filter_id_raw = new_filter(
-            self.client,
-            registry_address_bin,
-            topics,
-            from_block=from_block,
-            to_block=to_block,
-        )
-
-        return Filter(
-            self.client,
-            filter_id_raw,
-        )
-
-
-class ChannelManager(object):
-    def __init__(
-            self,
-            jsonrpc_client,
-            manager_address,
-            startgas=GAS_LIMIT,
-            gasprice=GAS_PRICE,
-            poll_timeout=DEFAULT_POLL_TIMEOUT):
-        # pylint: disable=too-many-arguments
-
-        result = jsonrpc_client.call(
-            'eth_getCode',
-            address_encoder(manager_address),
-            'latest',
-        )
-
-        if result == '0x':
-            raise ValueError('Channel manager address {} does not contain code'.format(
-                address_encoder(manager_address),
-            ))
-
-        proxy = jsonrpc_client.new_abi_contract(
-            CHANNEL_MANAGER_ABI,
-            address_encoder(manager_address),
-        )
-
-        self.address = manager_address
-        self.proxy = proxy
-        self.client = jsonrpc_client
-        self.startgas = startgas
-        self.gasprice = gasprice
-        self.poll_timeout = poll_timeout
-
-    def token_address(self):
-        """ Return the token of this manager. """
-        return address_decoder(self.proxy.tokenAddress.call())
-
-    def new_netting_channel(self, peer1, peer2, settle_timeout):
-        if not isaddress(peer1):
-            raise ValueError('The peer1 must be a valid address')
-
-        if not isaddress(peer2):
-            raise ValueError('The peer2 must be a valid address')
-
-        if settle_timeout < NETTINGCHANNEL_SETTLE_TIMEOUT_MIN:
-            raise ValueError('settle_timeout must be larger-or-equal to {}'.format(
-                NETTINGCHANNEL_SETTLE_TIMEOUT_MIN
-            ))
-
-        if privatekey_to_address(self.client.privkey) == peer1:
-            other = peer2
-        else:
-            other = peer1
-
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.newChannel,
-            other,
-            settle_timeout,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-        # TODO: raise if the transaction failed because there is an existing
-        # channel in place
-
-        netting_channel_results_encoded = self.proxy.getChannelWith.call(
-            other,
-            startgas=self.startgas,
-        )
-
-        # address is at index 0
-        netting_channel_address_encoded = netting_channel_results_encoded
-
-        if not netting_channel_address_encoded:
-            log.error('netting_channel_address failed', peer1=pex(peer1), peer2=pex(peer2))
-            raise RuntimeError('netting_channel_address failed')
-
-        netting_channel_address_bin = address_decoder(netting_channel_address_encoded)
-
-        log.info(
-            'new_netting_channel called',
-            peer1=pex(peer1),
-            peer2=pex(peer2),
-            netting_channel=pex(netting_channel_address_bin),
-        )
-
-        return netting_channel_address_bin
-
-    def channels_addresses(self):
-        # for simplicity the smart contract return a shallow list where every
-        # second item forms a tuple
-        channel_flat_encoded = self.proxy.getChannelsParticipants.call(startgas=self.startgas)
-
-        channel_flat = [
-            address_decoder(channel)
-            for channel in channel_flat_encoded
-        ]
-
-        # [a,b,c,d] -> [(a,b),(c,d)]
-        channel_iter = iter(channel_flat)
-        return zip(channel_iter, channel_iter)
-
-    def channels_by_participant(self, participant_address):  # pylint: disable=invalid-name
-        """ Return a list of channel address that `participant_address` is a participant. """
-        address_list = self.proxy.nettingContractsByAddress.call(
-            participant_address,
-            startgas=self.startgas,
-        )
-
-        return [
-            address_decoder(address)
-            for address in address_list
-        ]
-
-    def channelnew_filter(self, from_block=None, to_block=None):
-        """ Install a new filter for ChannelNew events.
-
-        Return:
-            Filter: The filter instance.
-        """
-        # participant_address_hex = address_encoder(privatekey_to_address(self.client.privkey))
-        # topics = [
-        #     CHANNELNEW_EVENTID, [node_address_hex, None], [None, node_address_hex],
-        # ]
-        topics = [CHANNELNEW_EVENTID]
-
-        channel_manager_address_bin = self.proxy.address
-        filter_id_raw = new_filter(
-            self.client,
-            channel_manager_address_bin,
-            topics,
-            from_block=from_block,
-            to_block=to_block
-        )
-
-        return Filter(
-            self.client,
-            filter_id_raw,
-        )
-
-
-class NettingChannel(object):
-    def __init__(
-            self,
-            jsonrpc_client,
-            channel_address,
-            startgas=GAS_LIMIT,
-            gasprice=GAS_PRICE,
-            poll_timeout=DEFAULT_POLL_TIMEOUT):
-        # pylint: disable=too-many-arguments
-
-        result = jsonrpc_client.call(
-            'eth_getCode',
-            address_encoder(channel_address),
-            'latest',
-        )
-
-        if result == '0x':
-            raise ValueError('Netting channel address {} does not contain code'.format(
-                address_encoder(channel_address),
-            ))
-
-        proxy = jsonrpc_client.new_abi_contract(
-            NETTING_CHANNEL_ABI,
-            address_encoder(channel_address),
-        )
-
-        self.address = channel_address
-        self.proxy = proxy
-        self.client = jsonrpc_client
-        self.startgas = startgas
-        self.gasprice = gasprice
-        self.poll_timeout = poll_timeout
-
-        # check we are a participant of the given channel
-        self.node_address = privatekey_to_address(self.client.privkey)
-        self.detail(self.node_address)
-
-    def token_address(self):
-        return address_decoder(self.proxy.tokenAddress.call())
-
-    def detail(self, our_address):
-        """`our_address` is an argument used only in mock_client.py but is also
-        kept here to maintain a consistent interface"""
-        our_address = self.client.sender
-        data = self.proxy.addressAndBalance.call(startgas=self.startgas)
-        settle_timeout = self.proxy.settleTimeout.call(startgas=self.startgas)
-
-        if data == '':
-            raise RuntimeError('addressAndBalance call failed.')
-
-        if settle_timeout == '':
-            raise RuntimeError('settleTimeout call failed.')
-
-        if address_decoder(data[0]) == our_address:
-            return {
-                'our_address': address_decoder(data[0]),
-                'our_balance': data[1],
-                'partner_address': address_decoder(data[2]),
-                'partner_balance': data[3],
-                'settle_timeout': settle_timeout,
-            }
-
-        if address_decoder(data[2]) == our_address:
-            return {
-                'our_address': address_decoder(data[2]),
-                'our_balance': data[3],
-                'partner_address': address_decoder(data[0]),
-                'partner_balance': data[1],
-                'settle_timeout': settle_timeout,
-            }
-
-        raise ValueError('We [{}] are not a participant of the given channel ({}, {})'.format(
-            pex(our_address),
-            data[0],
-            data[2],
-        ))
-
-    def settle_timeout(self):
-        settle_timeout = self.proxy.settleTimeout.call()
-        return settle_timeout
-
-    def can_transfer(self):
-        if self.proxy.closed.call() != 0:
-            return False
-
-        return (
-            self.proxy.opened.call() != 0 and
-            self.detail(None)['our_balance'] > 0
-        )
-
-    def deposit(self, amount):
-        if not isinstance(amount, (int, long)):
-            raise ValueError('amount needs to be an integral number.')
-
-        token = Token(
-            self.client,
-            self.token_address(),
-            poll_timeout=self.poll_timeout,
-        )
-        current_balance = token.balance_of(self.node_address)
-
-        if current_balance < amount:
-            raise ValueError('deposit [{}] cant be larger than the available balance [{}].'.format(
-                amount,
-                current_balance,
-            ))
-
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.deposit,
-            amount,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-        log.info('deposit called', contract=pex(self.address), amount=amount)
-
-    def opened(self):
-        return self.proxy.opened.call()
-
-    def closed(self):
-        return self.proxy.closed.call()
-
-    def closing_address(self):
-        return address_decoder(self.proxy.closingAddress())
-
-    def settled(self):
-        return self.proxy.settled.call()
-
-    def close(self, their_transfer):
-        if their_transfer:
-            their_encoded = their_transfer.encode()
-        else:
-            their_encoded = ''
-
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.close,
-            their_encoded,
-        )
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-        log.info(
-            'close called',
-            contract=pex(self.address),
-            their_transfer=their_transfer,
-        )
-
-    def update_transfer(self, their_transfer):
-        if their_transfer is not None:
-            their_transfer_encoded = their_transfer.encode()
-
-            transaction_hash = estimate_and_transact(
-                self,
-                self.proxy.updateTransfer,
-                their_transfer_encoded,
-            )
-
+        if self.eth_node == EthClient.GETH:
             try:
-                self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-            except JSONRPCPollTimeoutException as e:
-                raise e
-            except InvalidTransaction as e:
-                raise e
+                trace = self.web3.manager.request_blocking(
+                    RPCEndpoint("debug_traceTransaction"), [to_hex(transaction_hash), {}]
+                )
+            except ValueError:
+                # `debug` API is not enabled, return `None` since the failing
+                # reason is unknown.
+                return None
 
-            log.info(
-                'update_transfer called',
-                contract=pex(self.address),
-                their_transfer=their_transfer,
-            )
-            # TODO: check if the ChannelSecretRevealed event was emitted and if
-            # it wasn't raise an error
+            return trace.structLogs[-1].op == GETH_REQUIRE_OPCODE
 
-    def withdraw(self, unlock_proofs):
-        # force a list to get the length (could be a generator)
-        unlock_proofs = list(unlock_proofs)
-        log.info(
-            '%s locks to unlock',
-            len(unlock_proofs),
-            contract=pex(self.address),
-        )
-
-        for merkle_proof, locked_encoded, secret in unlock_proofs:
-            if isinstance(locked_encoded, messages.Lock):
-                raise ValueError('unlock must be called with a lock encoded `.as_bytes`')
-
-            merkleproof_encoded = ''.join(merkle_proof)
-
-            transaction_hash = estimate_and_transact(
-                self,
-                self.proxy.withdraw,
-                locked_encoded,
-                merkleproof_encoded,
-                secret,
-            )
-
+        if self.eth_node == EthClient.PARITY:
             try:
-                self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-            except JSONRPCPollTimeoutException as e:
-                raise e
-            except InvalidTransaction as e:
-                raise e
+                response = self.web3.manager.request_blocking(
+                    RPCEndpoint("trace_replayTransaction"), [to_hex(transaction_hash), ["trace"]]
+                )
+            except ValueError:
+                # `traces` API is not enabled, return `None` since the failing
+                # reason is unknown.
+                return None
 
-            # TODO: check if the ChannelSecretRevealed event was emitted and if
-            # it wasn't raise an error
+            # The manual tests only had a single trace, this may not be always correct.
+            first_trace = response.trace[0]
 
-            # if log.getEffectiveLevel() >= logging.INFO:  # only decode the lock if need to
-            lock = messages.Lock.from_bytes(locked_encoded)
-            log.info(
-                'unlock called',
-                contract=pex(self.address),
-                lock=lock,
-                secret=encode_hex(secret),
-            )
+            return first_trace["error"] == PARITY_REQUIRE_ERROR
 
-    def settle(self):
-        transaction_hash = estimate_and_transact(
-            self,
-            self.proxy.settle,
-        )
-
-        try:
-            self.client.poll(transaction_hash.decode('hex'), timeout=self.poll_timeout)
-        except JSONRPCPollTimeoutException as e:
-            raise e
-        except InvalidTransaction as e:
-            raise e
-
-        # TODO: check if the ChannelSettled event was emitted and if it wasn't raise an error
-        log.info('settle called', contract=pex(self.address))
-
-    def events_filter(self, topics, from_block=None, to_block=None):
-        """ Install a new filter for an array of topics emitted by the netting contract.
-        Args:
-            topics (list): A list of event ids to filter for. Can also be None,
-                           in which case all events are queried.
-
-        Return:
-            Filter: The filter instance.
-        """
-        netting_channel_address_bin = self.proxy.address
-        filter_id_raw = new_filter(
-            self.client,
-            netting_channel_address_bin,
-            topics=topics,
-            from_block=from_block,
-            to_block=to_block
-        )
-
-        return Filter(
-            self.client,
-            filter_id_raw,
-        )
-
-    def all_events_filter(self, from_block=None, to_block=None):
-        """ Install a new filter for all the events emitted by the current netting channel contract
-
-        Return:
-            Filter: The filter instance.
-        """
-        return self.events_filter(None, from_block, to_block)
+        return None

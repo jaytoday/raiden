@@ -1,69 +1,86 @@
-# -*- coding: utf-8 -*-
-from raiden.transfer.architecture import Event
 # pylint: disable=too-many-arguments,too-few-public-methods
+from dataclasses import dataclass, field
+
+from raiden.constants import EMPTY_SECRETHASH
+from raiden.transfer.architecture import Event, SendMessageEvent
+from raiden.transfer.mediated_transfer.state import LockedTransferUnsignedState
+from raiden.transfer.state import BalanceProofUnsignedState
+from raiden.utils.secrethash import sha256_secrethash
+from raiden.utils.typing import (
+    Address,
+    BlockExpiration,
+    List,
+    PaymentAmount,
+    PaymentID,
+    Secret,
+    SecretHash,
+    TokenAddress,
+    TokenNetworkAddress,
+    typecheck,
+)
 
 
-def mediatedtransfer(transfer, receiver):
-    """ Create SendMediatedTransfer from LockedTransferState. """
-    return SendMediatedTransfer(
-        transfer.identifier,
-        transfer.token,
-        transfer.amount,
-        transfer.hashlock,
-        transfer.initiator,
-        transfer.target,
-        transfer.expiration,
-        receiver,
-    )
+@dataclass(frozen=True)
+class SendLockExpired(SendMessageEvent):
+    balance_proof: BalanceProofUnsignedState
+    secrethash: SecretHash
 
 
-class SendMediatedTransfer(Event):
-    """ A mediated transfer that must be sent to `node_address`. """
-    def __init__(
-            self,
-            identifier,
-            token,
-            amount,
-            hashlock,
-            initiator,
-            target,
-            expiration,
-            receiver):
+@dataclass(frozen=True)
+class SendLockedTransfer(SendMessageEvent):
+    """A locked transfer that must be sent to `recipient`."""
 
-        self.identifier = identifier
-        self.token = token
-        self.amount = amount
-        self.hashlock = hashlock
-        self.initiator = initiator
-        self.target = target
-        self.expiration = expiration
-        self.receiver = receiver
+    transfer: LockedTransferUnsignedState
+
+    def __post_init__(self) -> None:
+        typecheck(self.transfer, LockedTransferUnsignedState)
+
+    @property
+    def balance_proof(self) -> BalanceProofUnsignedState:
+        return self.transfer.balance_proof
 
 
-class SendRevealSecret(Event):
-    """ Event used to send a reveal the secret to another node, not the same as
-    a balance-proof.
+@dataclass(frozen=True)
+class SendSecretReveal(SendMessageEvent):
+    """Sends a SecretReveal to another node.
 
-    Used by payees: The target and mediator nodes.
+    This event is used once the secret is known locally and an action must be
+    performed on the recipient:
+
+        - For receivers in the payee role, it informs the node that the lock has
+            been released and the token can be claimed, either on-chain or
+            off-chain.
+        - For receivers in the payer role, it tells the payer that the payee
+            knows the secret and wants to claim the lock off-chain, so the payer
+            may unlock the lock and send an up-to-date balance proof to the payee,
+            avoiding on-chain payments which would require the channel to be
+            closed.
+
+    For any mediated transfer:
+        - The initiator will only perform the payer role.
+        - The target will only perform the payee role.
+        - The mediators will have `n` channels at the payee role and `n` at the
+          payer role, where `n` is equal to `1 + number_of_refunds`.
 
     Note:
-        The payee must only update it's local balance once the payer sends an
-        update message with a balance-proof. This is a requirement for keeping
-        the nodes synchronized. The reveal secret message flows from the
-        receiver to the sender, so when the secret is learned it is not yet
-        time to update the balance.
+        The payee must only update its local balance once the payer sends an
+        up-to-date balance-proof message. This is a requirement for keeping the
+        nodes synchronized. The reveal secret message flows from the recipient
+        to the sender, so when the secret is learned it is not yet time to
+        update the balance.
     """
-    def __init__(self, identifier, secret, token, receiver, sender):
-        self.identifier = identifier
-        self.secret = secret
-        self.token = token
-        self.receiver = receiver
-        self.sender = sender
+
+    secret: Secret = field(repr=False)
+    secrethash: SecretHash = field(default=EMPTY_SECRETHASH)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "secrethash", sha256_secrethash(self.secret))
 
 
-class SendBalanceProof(Event):
-    """ Event used to release a lock locally and send a balance-proof to the
-    counter-party, allowing the counter-party to withdraw the lock.
+@dataclass(frozen=True)
+class SendUnlock(SendMessageEvent):
+    """Event to send a balance-proof to the counter-party, used after a lock
+    is unlocked locally allowing the counter-party to claim it.
 
     Used by payers: The initiator and mediator nodes.
 
@@ -71,98 +88,91 @@ class SendBalanceProof(Event):
         This event has a dual role, it serves as a synchronization and as
         balance-proof for the netting channel smart contract.
 
-        Nodes need to keep the last known merkle root synchronized. This is
+        Nodes need to keep the last known locksroot synchronized. This is
         required by the receiving end of a transfer in order to properly
         validate. The rule is "only the party that owns the current payment
         channel may change it" (remember that a netting channel is composed of
-        two uni-directional channels), as a consequence the merkle root is only
-        updated by the receiver once a balance proof message is received.
-    """
-    def __init__(self, identifier, channel_address, token, receiver, secret):
-        self.identifier = identifier
-        self.channel_address = channel_address
-        self.token = token
-        self.receiver = receiver
-
-        # XXX: Secret is not required for the balance proof to dispatch the message
-        self.secret = secret
-
-
-class SendSecretRequest(Event):
-    """ Event used by a target node to request the secret from the initiator
-    (`receiver`).
-    """
-    def __init__(self, identifier, amount, hashlock, receiver):
-        self.identifier = identifier
-        self.amount = amount
-        self.hashlock = hashlock
-        self.receiver = receiver
-
-
-class SendRefundTransfer(Event):
-    """ Event used to cleanly backtrack the current node in the route.
-
-    This message will pay back the same amount of token from the receiver to
-    the sender, allowing the sender to try a different route without the risk
-    of losing token.
-    """
-    def __init__(
-            self,
-            identifier,
-            token,
-            amount,
-            hashlock,
-            expiration,
-            receiver):
-
-        self.identifier = identifier
-        self.token = token
-        self.amount = amount
-        self.hashlock = hashlock
-        self.expiration = expiration
-        self.receiver = receiver
-
-
-class EventTransferFailed(Event):
-    """ Event emitted by the initiator when a transfer cannot be completed.
-
-    Note:
-        Mediator and target nodes cannot emit this event since they cannot
-        cancel the transfer, these nodes may only reject the transfer before
-        intereacting or wait for the lock expiration.
+        two uni-directional channels), as a consequence the locksroot is only
+        updated by the recipient once a balance proof message is received.
     """
 
-    def __init__(self, identifier, reason):
-        self.identifier = identifier
-        self.reason = reason
+    payment_identifier: PaymentID
+    token_address: TokenAddress
+    balance_proof: BalanceProofUnsignedState = field(repr=False)
+    secret: Secret = field(repr=False)
+    secrethash: SecretHash = field(default=EMPTY_SECRETHASH)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "secrethash", sha256_secrethash(self.secret))
 
 
-class EventTransferCompleted(Event):
-    """ Event emitted when the transfer is complete for the given node.  """
-
-    def __init__(self, identifier, secret, hashlock):
-        self.identifier = identifier
-        self.secret = secret
-        self.hashlock = hashlock
-
-
-class ContractSendChannelClose(Event):
-    """ Event emitted to close the netting channel.
-
-    This event is used when a node needs to prepare the channel to withdraw
-    on-chain.
+@dataclass(frozen=True)
+class SendSecretRequest(SendMessageEvent):
+    """Event used by a target node to request the secret from the initiator
+    (`recipient`).
     """
 
-    def __init__(self, channel_address):
-        self.channel_address = channel_address
+    payment_identifier: PaymentID
+    amount: PaymentAmount
+    expiration: BlockExpiration
+    secrethash: SecretHash
 
 
-class ContractSendWithdraw(Event):
-    """ Event emitted when the lock must be withdrawn on-chain. """
+@dataclass(frozen=True)
+class EventUnlockSuccess(Event):
+    """Event emitted when a lock unlock succeded."""
 
-    def __init__(self, transfer, channel_address):
-        if transfer.secret is None:
-            raise ValueError('Transfer must have the secret set.')
+    identifier: PaymentID
+    secrethash: SecretHash
 
-        self.transfer = transfer
-        self.channel_address = channel_address
+
+@dataclass(frozen=True)
+class EventUnlockFailed(Event):
+    """Event emitted when a lock unlock failed."""
+
+    identifier: PaymentID
+    secrethash: SecretHash
+    reason: str
+
+
+@dataclass(frozen=True)
+class EventUnlockClaimSuccess(Event):
+    """Event emitted when a lock claim succeded."""
+
+    identifier: PaymentID
+    secrethash: SecretHash
+
+
+@dataclass(frozen=True)
+class EventUnlockClaimFailed(Event):
+    """Event emitted when a lock claim failed."""
+
+    identifier: PaymentID
+    secrethash: SecretHash
+    reason: str
+
+
+@dataclass(frozen=True)
+class EventUnexpectedSecretReveal(Event):
+    """Event emitted when an unexpected secret reveal message is received."""
+
+    secrethash: SecretHash
+    reason: str
+
+
+@dataclass(frozen=True)
+class EventRouteFailed(Event):
+    """Event emitted when a route failed.
+    As a payment can try different routes to reach the intended target
+    some of the routes can fail. This event is emitted when a route failed.
+    This means that multiple EventRouteFailed for a given payment and it's
+    therefore different to EventPaymentSentFailed.
+    A route can fail for two reasons:
+    - A refund transfer reaches the initiator (it's not important if this
+        refund transfer is unlocked or not)
+    - A lock expires
+    """
+
+    secrethash: SecretHash
+    route: List[Address]
+    token_network_address: TokenNetworkAddress

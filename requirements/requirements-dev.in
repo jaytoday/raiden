@@ -1,0 +1,54 @@
+# We need to include the compiled base requirements to make sure we're not pulling in
+# incompatible dependencies
+-r requirements.txt
+
+# split out to allow faster building of docs and to not require python 3.7
+# since they don't support it in RTD yet: https://github.com/rtfd/readthedocs.org/issues/4713
+# FIXME: Temporarily remove docs requirements from dev until releases removes the pin of
+# `semantic-version<2.7`. See: https://github.com/bitprophet/releases/pull/86
+# -r requirements-docs.txt
+
+# Dependencies
+pip-tools~=6.1.0  # this is used by 'deps.py'
+
+# Linting
+flake8
+flake8-comprehensions
+flake8-bugbear
+flake8-tuple
+isort
+readme-renderer
+pylint
+mypy
+black==21.4b2
+typed-ast>=1.4.2
+
+# Testing
+pytest
+pytest-random
+pytest-select
+pytest-xdist
+grequests
+pexpect
+hypothesis
+raiden-api-client
+responses
+flaky
+Faker
+
+# Debugging
+ipython
+pdbpp
+colour
+py-spy
+nest-asyncio
+
+# Continuous Integration
+coverage
+
+# Release
+bump2version
+
+# Test support
+matrix-synapse==1.33.0
+six>=1.13.0  # work around bad deps declaration in treq, see https://github.com/twisted/treq/commit/934e127a2b915bf02be86d23f2cf8a65bcdb2533#r42782781
